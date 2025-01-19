@@ -1,0 +1,11 @@
+[project]
+name = "learnable-stitching"
+description = "Experiments on neural stitching with further fine-tuning"
+requires-python = ">= 3.10"
+dependencies = [
+    "bonsai-nn-library",
+]
+
+
+[tool.black]
+line-length = 100
