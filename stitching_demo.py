@@ -4,13 +4,12 @@ import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import nn_lib.models.utils
 import torch
-from torch import nn
 from nn_lib.datasets import ImageNetDataModule
 from nn_lib.models import get_pretrained_model, GraphModulePlus
-from nn_lib.models.fancy_layers import RegressableConv2d
+from nn_lib.models.fancy_layers import RegressableConv2d, Interpolate2d
 from nn_lib.models.utils import conv2d_shape_inverse
+from torch import nn
 from tqdm.auto import tqdm
-
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -78,7 +77,7 @@ conv_params = {
     "dilation": 1,
 }
 stitching_layer = nn.Sequential(
-    nn.Upsample(size=conv2d_shape_inverse(dummy_B.shape[-2:], **conv_params)),
+    Interpolate2d(size=conv2d_shape_inverse(dummy_B.shape[-2:], **conv_params), mode="bilinear"),
     RegressableConv2d(in_channels=dummy_A.shape[1], out_channels=dummy_B.shape[1], **conv_params),
 )
 
