@@ -164,3 +164,6 @@ cython_debug/
 
 # Store no pycharm project config files on git
 .idea
+
+#A graph figure for testing or observing
+TempGrap.png

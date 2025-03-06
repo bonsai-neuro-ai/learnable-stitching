@@ -4,7 +4,7 @@ import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import nn_lib.models.utils
 import torch
-from nn_lib.analysis.stitching import Conv1x1StitchingLayer
+from nn_lib.analysis.stitching import Conv1x1StitchingLayer, create_stitching_model
 from nn_lib.datasets import ImageNetDataModule
 from nn_lib.models import get_pretrained_model, graph_utils
 from torch.fx import symbolic_trace, GraphModule
@@ -54,6 +54,7 @@ def display_model_graph(mdl, dpi=200):
     plt.figure(figsize=(image.shape[1] / dpi, image.shape[0] / dpi), dpi=dpi)
     plt.imshow(image)
     plt.axis("off")
+    plt.savefig("TempGrap.png")
     plt.show()
 
 display_model_graph(modelA)
@@ -74,7 +75,7 @@ print("Output:", graph_utils.get_output(modelB.graph).name)
 # wrote) to do the model surgery; and (4) cleanup the graphs. Some of this is a little finicky,
 # so there is a nn_lib.analysis.stitching.create_stitching_model function that does steps (1)
 # thru (4) in one go. Maybe we can clean up this API a bit.
-layerA = "add_3"
+layerA = "add_1"
 layerB = "add_5"
 
 # Step (1): Get 'subgraph' models which go input -> desired layer. Then, look at the output shape
