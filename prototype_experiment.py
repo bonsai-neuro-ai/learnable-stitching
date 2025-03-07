@@ -278,7 +278,7 @@ for layerA in layersA:
         with nn_lib.models.utils.frozen(modelA, stitching_layer):
             modelAxB.donorB.train()
 
-            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.001)
+            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.00001)
             
             #for i, (images, labels) in tqdm(enumerate(data_loader), total=batch_bound, desc= "Downstream Learning"):
             for i, (images, labels) in tqdm(enumerate(zip(images_2,labels_2)), total=len(images_2), desc= "Downstream Learning"): #same images and labels used for the stitching layer
@@ -311,6 +311,7 @@ for layerA in layersA:
                 if k.startswith("stitching_layer"):
                     assert torch.allclose(v, paramsAxB[k])
 
+        modelAxB.donorB.eval()
 
         #sanity print statements to observe downstream learning is working properly
         quick_run_and_check(modelA, test_images, test_labels, "ModelA")
