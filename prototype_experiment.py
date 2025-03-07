@@ -21,7 +21,7 @@ from torch.nn import Conv2d, functional
 from tqdm.auto import tqdm
 
 
-#from stitching_demo import quick_run_and_check, display_model_graph
+#from stitching_demo import quick_run_and_check
 
 import seaborn #for beatiful graphs
 import pandas as pd
@@ -44,7 +44,9 @@ stitching_families = {"conv1x1": Conv2d}
 
 #Knob 3 
 #The selection of the loss function
-loss_functions = {"class_labels": 0, "soft_labels": 1}
+loss_functions = ["class", "soft"]
+label_type = loss_functions[0]
+
 
 #Set torch to use cuda GPUs
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -53,10 +55,13 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #sShoulnd't it just be datasets? There is no data folder in the src directory?
 #what is number of workers? 
 data_module = datalist["imagenet"]
+init_batch_num = 1
+batch_bound = 100
+
 
 #prepare and setup data
 data_module.prepare_data()
-data_module.setup("test")
+
 
 #Get pretrained models that will be stitched together
 modelA = modellist["imagenet"]["resnet50"]
@@ -65,8 +70,8 @@ modelB = modellist["imagenet"]["resnet101"]
 #Get the graph trace of our pretrained models 
 traceA = symbolic_trace(modelA)
 traceB = symbolic_trace(modelB)
-modelA = gmp.GraphModulePlus(root = traceA, graph = traceA.graph, class_name = "HK-Arson")
-modelB = gmp.GraphModulePlus(root = traceB, graph = traceB.graph, class_name = "HK-Butcher")
+modelA = gmp.GraphModulePlus(root = traceA, graph = traceA.graph, class_name = "mA")
+modelB = gmp.GraphModulePlus(root = traceB, graph = traceB.graph, class_name = "mB")
 
 
 
@@ -105,17 +110,28 @@ def display_model_graph(graph, file, dpi=200):
     plt.savefig(file)
     plt.show()
 
+def quick_run_and_check(model, images, labels, name):
+    with torch.no_grad():
+        output = model(images)
+    print(f"{name}: {torch.sum(torch.argmax(output, dim=1) == labels).item()} / {len(labels)}")
+
 #display_model_graph(modelA, "temp.png")
 
-#create stitching model, train the stitching layer, record loss value, repeat for all different possible connections 
-#how can I more easily iterate across layers? Across nodes? across different layer sections? How to pull out adds?
-#how to stitch between different sections? 
-#modelA.graph.print_tabular()
+
+data_module.setup("test")
+test_data_loader = data_module.test_dataloader()
+test_images, test_labels = next(iter(test_data_loader))
+test_images, test_labels = test_images.to(device), test_labels.to(device)
+
+data_module.setup("fit")
+data_loader = data_module.train_dataloader()
 
 
-score = {"name": [], "value": [], "ParentA":  [], "ParentB": []}
+
+
 for layerA in layersA:
     for layerB in layersB:
+        
 
         #use dummy inputs to extract input and out put shape for desired layers
 
@@ -134,40 +150,15 @@ for layerA in layersA:
 
         d_a = modelA_(dummy_input)
         d_b = modelB_(dummy_input)
-        d_a.to(device)
-        d_b.to(device)
+  
+
+        #retrieve next node for stitching the graph
+        layerB_next = modelB._resolve_nodes(layerB)[0].users
+        layerB_next = next(iter(layerB_next)).name
+
         
         #print(dummy_activationsA.shape[1:] == d_a.shape[1:])
         #print(dummy_activationsB.shape[1:] == d_b.shape[1:])
-
-            #create stitched model
-    
-        linear_layer = torch.nn.Linear(
-            in_features= d_a.shape[1],
-            out_features=d_b.shape[1]
-        )
-
-        ''' dead idea to try and get nn.sequential to work
-        class stitch_resize(nn.Module):
-            def __init__(
-                self,
-                kernal_size = 1,
-                stride = 1,
-                dilation = 1,
-                padding = 0
-            ):
-                super().__init__()
-                self._resize_kwargs = {
-                    "size": size,
-                    "kernal_size": kernal_size,
-                    "stride": stride,
-                    "dilation": dilation,
-                    "padding": padding
-                }
-
-            def forward(self, x):
-                return Resize(size=conv2d_shape_inverse(out_shape=d_b.shape[-2:], **self._resize_kwargs))'''
-
 
         #select the in_features and out_features to be the channel dimension of the convolution dummy inputs, probably not neccessary
         #nn.sequential requires all inputs to be nn.module, thus cannot use resize, 
@@ -178,102 +169,150 @@ for layerA in layersA:
         )
 
         #stitching_layer.add_module('inter', fl.Interpolate2d(size=conv2d_shape_inverse(out_shape=d_b.shape[-2:], kernel_size=1, stride = 1, dilation = 1, padding = 0), mode = mode))
-        
-        
-        '''
-        for name, module in stitching_layer.named_children():
-            print(name)
-            for n, m in module.named_children():
-                print(name, n)
-        
-        #code to get a graph of the stitching layer, must remove regressableConv2d to use symbolic trace
-        stitch_graph = symbolic_trace(stitching_layer)
-        stitch_graph.graph.inserting_after()
-        #stitch_graph.graph.call_module("inter", args=(), kwargs={})
-        display_model_graph(stitch_graph, "Stitch_graph.png") #used to retrieve a snippet of the potential graph of the stitching layer to see the input node
-        '''
-
-
-
-        #stitching_layer = symbolic_trace(stitching_layer)
         stitching_layer.to(device)
-
+        
  
         assert stitching_layer(d_a).shape == d_b.shape
         display_model_graph(modelA_, "DonationA_Fig.png")
         display_model_graph(modelB_, "DonationB_Fig.png")
 
         #Stitch the stitching layer to the bottom of A_ subgraph
-        #modelAx = modelA_.new_from_merge({ "DonationA": modelA_, "": stitching_layer}, {"DonationA_"+layerA: [".0"]}, auto_trace = False)
+        modelAxB = modelA_.new_from_merge({ "donorA": modelA, "sl": stitching_layer, "donorB": modelB}, 
+                                          {"sl": ["donorA_"+layerA], "donorB_"+layerB_next: ["sl"]}, 
+                                          auto_trace = False)
 
-        #Stich the half made stitchign modelA to the modelB, get complete stitching model
-        #without the stitching layer, we cannot recompile
-        #modelAxB = modelA_.new_from_merge({"DonationA": modelA_, "DonationB": modelB_},
-         #                                {"DonationB_"+layerB: ["DonationB_"+layerA]})
+
+        display_model_graph(modelAxB, "Stitched_Model_fig.png")
+
+        # Record parameters before any training so that we can sanity-check that only the correct things
+        # are changing. The .clone() is necessary so we get a snapshot of the parameters at this point in
+        # time, rather than a reference to the parameters which will be updated later.
+        paramsA = {k: v.clone() for k, v in modelA.named_parameters()}
+        paramsB = {k: v.clone() for k, v in modelB.named_parameters()}
+        paramsAxB = {k: v.clone() for k, v in modelAxB.named_parameters()}
+
+
+
+        reg_input = []
+        reg_output = []
+        #initialize the stitchig layer using regression for a training speed up
+        #initialize a couple of batches according to the init_batch 
+        for i, (images, labels) in tqdm(enumerate(data_loader), total= init_batch_num, desc = "collecting batches for regression init"):
+            if (i >= init_batch_num): 
+                break
+
+            images = images.to(device)
+            labels = labels.to(device)
+
+            reg_input.append(stitching_layer[0](modelA_(images)))
+            reg_output.append(modelB_(images))
+
+        #sanity print statements to see the initial accuracy of the models
+        quick_run_and_check(modelA, test_images, test_labels, "ModelA")
+        quick_run_and_check(modelB, test_images, test_labels, "ModelB")
+        quick_run_and_check(modelAxB, test_images, test_labels, "ModelAxB")
         
+        #Running Init By Regression
+        stitching_layer[1].init_by_regression(torch.cat(reg_input), torch.cat(reg_output))
 
-        #display_model_graph(modelAx, "Stitched_Model_fig.png")
+        #sanity print statements to see the initial accuracy of the models
+        print("INIT_BY_REGRESSION")
+        quick_run_and_check(modelA, test_images, test_labels, "ModelA")
+        quick_run_and_check(modelB, test_images, test_labels, "ModelB")
+        quick_run_and_check(modelAxB, test_images, test_labels, "ModelAxB")
 
         #freeze context for training the stitching layer
-        #with nn_lib.models.utils.frozen(modelA, modelB):
+        with nn_lib.models.utils.frozen(modelA, modelB):
+            
+            modelAxB.sl.train()
+            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.001)
+
+            images_2 = []
+            labels_2 = []
+            #start optimizing
+            for i, (images, labels) in tqdm(enumerate(data_loader), total= batch_bound, desc="Training the Stitching Layer"):
+                    if (i == batch_bound): 
+                        break
+
+                    images_2.append(images)
+                    labels_2.append(labels)
+
+                    images = images.to(device)
+                    labels = labels.to(device)
+        
+                    optimizer.zero_grad()
+                    output = modelAxB(images)
+                    #print(labels)
+
+
+                    if label_type == "soft": #soft labels
+                            labels = nn.Softmax(modelA(images))
+
+                    
+                    # This is task loss, but could be updated to be soft-labels to optimize match to model B
+                    loss = torch.nn.functional.cross_entropy(output, labels)
+
+                    #backprop and adjust
+                    loss.backward()
+                    optimizer.step()
+
+        #sanity print statements to observe stitching layer improvement
+        quick_run_and_check(modelA, test_images, test_labels, "ModelA")
+        quick_run_and_check(modelB, test_images, test_labels, "ModelB")
+        quick_run_and_check(modelAxB, test_images, test_labels, "ModelAxB")
+
+        # Assert that no parameters changed *except* for stitched_model.stitching_layer
+        for k, v in modelA.named_parameters():
+            assert torch.allclose(v, paramsA[k])
+        for k, v in modelB.named_parameters():
+            assert torch.allclose(v, paramsB[k])
+        for k, v in modelAxB.named_parameters():
+            if k.startswith("sl"):
+                assert not torch.allclose(v, paramsAxB[k])
+            else:
+                assert torch.allclose(v, paramsAxB[k])
+
 
         #freeze context for downstream learning
-        #with nn_lib.models.utils.frozen(modelA):
+        modelAxB.sl.eval()
+        with nn_lib.models.utils.frozen(modelA, stitching_layer):
+            modelB.train()
+
+            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.001)
+            
+            #for i, (images, labels) in tqdm(enumerate(data_loader), total=batch_bound, desc= "Downstream Learning"):
+            for i, (images, labels) in tqdm(enumerate(zip(images_2,labels_2)), total=len(images_2), desc= "Downstream Learning"): #same images and labels used for the stitching layer
+                    if (i == batch_bound): 
+                        break
+
+                    images = images.to(device)
+                    labels = labels.to(device)
         
-        '''
-        modelAB = graph_utils.stitch_graphs(
-            named_modules={
-                "modelA": modelA,
-                "stitching_layer": stitching_layer,
-                "modelB": modelB,
-            },
-            rewire_layers_from_to={
-                "modelA_" + layerA: "stitching_layer_x",
-                "stitching_layer_conv1x1": "modelB_" + layerB,
-            },
-            input_names=["modelA_" + node.name for node in graph_utils.get_inputs(modelA.graph)],
-            output_name="modelB_" + graph_utils.get_output(modelB.graph).args[0].name,
-        )
+                    #optimizer.zero_grad()
+                    output = modelAxB(images)
+                    #print(labels)
 
 
-        #THis functions is not working, error "expecting 3 channles for input, given 64 chanelles"
-        #modelAB = create_stitching_model(model1= modelA, layer1= layerA, input_shape1=dummy_activationsA.shape[1:],
-         #                               model2= modelB, layer2= layerB, input_shape2=dummy_activationsB.shape[1:])
+                    #if label_type == "soft": #soft labels can be derrived by picking the largest value from the softmax of the logits
+                            #labels = nn.Softmax(modelA(images))
+
+                    
+                    # This is task loss, but could be updated to be soft-labels to optimize match to model B
+                    loss = torch.nn.functional.cross_entropy(output, labels)
+
+                    #backprop and adjust
+                    loss.backward()
+                    optimizer.step()
         
-        # Inject the correct object back in.
-        modelAB.stitching_layer = stitching_layer
+            # Assert that no parameters changed *except* for modelB
+            for k, v in modelA.named_parameters():
+                assert torch.allclose(v, paramsA[k])
+            for k, v in modelAxB.named_parameters():
+                if k.startswith("stitching_layer"):
+                    assert torch.allclose(v, paramsAxB[k])
 
-        # Cleanup the graphs. This for instance removes the modelA outputs and modelB inputs,
-        modelAB.delete_all_unused_submodules()
 
-
-        #Set stitched model onto gpu
-        modelAB = modelAB.to(device).eval()
-
-        #Load data onto gpu
-        data_loader = data_module.test_dataloader()
-        images, labels = next(iter(data_loader))
-        images, labels = images.to(device), labels.to(device)
-
-        #Training the stitching layer to hard labels
-        print("\nLayerA: " + layerA + " LayerB: " + layerB)
-        print("=== DOING REGRESSION INIT ===")
-        batch_repsA = graph_utils.get_subgraph(modelA, inputs=["x"], output=layerA)(images)
-        batch_repsB = graph_utils.get_subgraph(modelB, inputs=["x"], output=layerB)(images)
-        modelAB.stitching_layer.init_by_regression(batch_repsA, batch_repsB)
-       
-        #sets of runs to see if it is working
-        
-        quick_run_and_check(modelA, images, labels, "ModelA")
-        quick_run_and_check(modelB, images, labels, "ModelB")
-
-        score["ParentA"].append(layerA)
-        score["ParentB"].append(layerB)
-        score["name"].append("Model--" + layerA + "--" + layerB)
-        score["value"].append(quick_run_and_check(modelAB, images, labels, "ModelAB"))
-
-data = pd.DataFrame.from_dict(score)
-
-compare_scores = data.pivot(index="ParentA", columns="ParentB", values="value")
-plot = seaborn.heatmap(compare_scores)
-plot.figure.savefig("practice_plot.png")'''
+        #sanity print statements to observe downstream learning is working properly
+        quick_run_and_check(modelA, test_images, test_labels, "ModelA")
+        quick_run_and_check(modelB, test_images, test_labels, "ModelB")
+        quick_run_and_check(modelAxB, test_images, test_labels, "ModelAxB")

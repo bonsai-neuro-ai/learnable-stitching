@@ -4,12 +4,8 @@ import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import nn_lib.models.utils
 import torch
-<<<<<<< HEAD
-from nn_lib.analysis.stitching import Conv1x1StitchingLayer, create_stitching_model
-=======
 from torch import nn
 import torch.nn.functional as F
->>>>>>> ca87031dc423bae092bb5d87066ccae9c6b98e59
 from nn_lib.datasets import ImageNetDataModule
 from nn_lib.models import get_pretrained_model, GraphModulePlus
 from tqdm.auto import tqdm
@@ -148,28 +144,8 @@ def display_model_graph(mdl, dpi=200):
 display_model_graph(modelA)
 display_model_graph(modelB)
 
-<<<<<<< HEAD
-# Print some metadata about each model's inputs and outputs. This illustrates how the GraphModule
-# contains a Graph which then contains node and connection information between the layers.
-print("=== Metadata for ModelA ===")
-print("Inputs:", [node.name for node in graph_utils.get_inputs(modelA.graph)])
-print("Output:", graph_utils.get_output(modelA.graph).name)
-print("=== Metadata for ModelB ===")
-print("Inputs:", [node.name for node in graph_utils.get_inputs(modelB.graph)])
-print("Output:", graph_utils.get_output(modelB.graph).name)
-
-# Create a hybrid stitched model. See the implementation of `create_stitching_model()` for
-# details. The main idea is to (1) run some dummy input through each model to query the shapes of
-# the tensors at the desired layers; (2) instantiate a Conv1x1StitchingLayer from those shapes; (
-# 3) call graph_utils.stitch_graphs() (which is a slightly more generic 'rewiring' interface I
-# wrote) to do the model surgery; and (4) cleanup the graphs. Some of this is a little finicky,
-# so there is a nn_lib.analysis.stitching.create_stitching_model function that does steps (1)
-# thru (4) in one go. Maybe we can clean up this API a bit.
-layerA = "add_1"
-=======
 # Create a hybrid stitched model.
 layerA = "add_3"
->>>>>>> ca87031dc423bae092bb5d87066ccae9c6b98e59
 layerB = "add_5"
 layerB_next = modelB._resolve_nodes(layerB)[0].users
 layerB_next = next(iter(layerB_next)).name

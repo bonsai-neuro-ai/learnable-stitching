@@ -1,0 +1,39 @@
+from pathlib import Path
+from typing import NamedTuple
+
+import mlflow
+from nn_lib.utils import save_as_artifact
+
+
+class ModelSpec(NamedTuple):
+    model: str
+    dataset: str
+
+
+def main(modelA: ModelSpec, modelB: ModelSpec, layerA: str, layerB: str, loss_type: str):
+
+    # dothething
+    ...
+
+    mlflow.log_metric("loss", loss.item(), step=step)
+
+    info = {"state_dict": modelAB.state_dict(),
+            "opt": optimizer.state_dict(),
+            "metadata": ...}
+    save_as_artifact(info, Path("weights") / "modelAB.pt")
+
+
+
+if __name__ == "__main__":
+    import jsonargparse
+
+    parser = jsonargparse.ArgumentParser()
+    parser.add_function_arguments(main)
+    args = parser.parse_args()
+
+    mlflow.set_experiment("learnable-stitching")
+    mlflow.set_tracking_uri("~/Rsearch/learnable-stitching/mlruns")
+
+    with mlflow.start_run(run_name=f"my fancy run {args.modelA}"):
+        mlflow.log_params(vars(args))
+        main(**vars(args))
