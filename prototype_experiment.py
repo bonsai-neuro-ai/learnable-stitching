@@ -276,7 +276,7 @@ for layerA in layersA:
         #freeze context for downstream learning
         modelAxB.sl.eval()
         with nn_lib.models.utils.frozen(modelA, stitching_layer):
-            modelB.train()
+            modelAxB.donorB.train()
 
             optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.001)
             
@@ -288,7 +288,7 @@ for layerA in layersA:
                     images = images.to(device)
                     labels = labels.to(device)
         
-                    #optimizer.zero_grad()
+                    optimizer.zero_grad()
                     output = modelAxB(images)
                     #print(labels)
 
