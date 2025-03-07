@@ -17,7 +17,7 @@ from nn_lib.models.utils import conv2d_shape_inverse
 from nn_lib.datasets import ImageNetDataModule, CocoDetectionDataModule
 from nn_lib.models import get_pretrained_model, graph_utils
 from torch.fx import symbolic_trace, GraphModule, graph
-from torch.nn import Conv2d, functional
+#from torch.nn import Conv2d, functional
 from tqdm.auto import tqdm
 
 
@@ -40,7 +40,7 @@ modellist = {"imagenet": imagenet_models, "coco": coco_models}
 
 #Knob 2
 #The selection of the stitching layer
-stitching_families = {"conv1x1": Conv2d}
+
 
 #Knob 3 
 #The selection of the loss function
@@ -225,7 +225,7 @@ for layerA in layersA:
         with nn_lib.models.utils.frozen(modelA, modelB):
             
             modelAxB.sl.train()
-            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.001)
+            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.000001)
 
             images_2 = []
             labels_2 = []
@@ -278,10 +278,10 @@ for layerA in layersA:
         with nn_lib.models.utils.frozen(modelA, stitching_layer):
             modelAxB.donorB.train()
 
-            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.00001)
+            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.000000001)
             
-            #for i, (images, labels) in tqdm(enumerate(data_loader), total=batch_bound, desc= "Downstream Learning"):
-            for i, (images, labels) in tqdm(enumerate(zip(images_2,labels_2)), total=len(images_2), desc= "Downstream Learning"): #same images and labels used for the stitching layer
+            for i, (images, labels) in tqdm(enumerate(data_loader), total=batch_bound, desc= "Downstream Learning"):
+            #for i, (images, labels) in tqdm(enumerate(zip(images_2,labels_2)), total=len(images_2), desc= "Downstream Learning"): #same images and labels used for the stitching layer
                     if (i == batch_bound): 
                         break
 
