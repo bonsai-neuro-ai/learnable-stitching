@@ -29,7 +29,67 @@ def return_accuracy(model, images, labels, name):
     #print(f"{name}: {torch.sum(torch.argmax(output, dim=1) == labels).item()} / {len(labels)}") #print statement for sanity checks
     return acc
 
-def create_and_test_stitched_model(data_module, modelA, modelB, layerA, layerB, stitch_family, label_type, device,  init_batch_num :int, batch_bound :int, epochs :int):
+def record_loss_metrics(modelA, modelB, loss, images, labels, name, step):
+    #record loss
+    mlflow.log_metric(name + "-loss-AxB", loss.item(), step=step)
+
+    #record loss of donors
+    outA = modelA(images)
+    lossA = torch.nn.functional.cross_entropy(outA, labels)
+    mlflow.log_metric(name + "-loss-A", lossA.item(), step=step)
+
+    outB = modelB(images)
+    lossB= torch.nn.functional.cross_entropy(outB, labels)
+    mlflow.log_metric(name + "-loss-B", lossB.item(), step=step)
+
+    #record stitching penalities
+    mlflow.log_metric(name + "-penalty-A", loss.item() - lossA.item(), step=step)
+    mlflow.log_metric(name + "-penalty-B", loss.item() - lossB.item(), step=step)
+
+#A function that records the validation accuracy of modelA, ModelB, and their stiched modelAxB
+# Currently there does not seem to be a validation set in the dataset in nn.lib, although imagenet does have a validation set
+def record_val_accuarcy(data_module, modelA, modelB, modelAxB, name, step):
+    data_module.setup("test")
+    data_loader = data_module.test_dataloader()
+
+    accA = 0
+    accB = 0
+    accAxB = 0
+
+    #calculate the accuarcy for each batch of the evalaution data set
+    #the return accurarcy function forces the gradients to be froze, so validation data should not be leaking into the training
+    for images, labels in data_loader:
+        accA += return_accuracy(modelA, images, labels, name)
+        accB += return_accuracy(modelB, images, labels, name)
+        accAxB += return_accuracy(modelAxB, images, labels, name)
+    
+    mlflow.log_metric(name + "-validation-A", accA, step=step)
+    mlflow.log_metric(name + "-validation-B", accB, step=step)
+    mlflow.log_metric(name + "-validation-AxB", accAxB, step=step)
+
+#A function that records the test accuracy of modelA, ModelB, and their stiched modelAxB
+def record_test_accuarcy(data_module, modelA, modelB, modelAxB, name, step):
+    data_module.setup("test")
+    data_loader = data_module.test_dataloader()
+
+    accA = 0
+    accB = 0
+    accAxB = 0
+
+    #calculate the accuarcy for each batch of the evalaution data set
+    #the return accurarcy function forces the gradients to be froze, so validation data should not be leaking into the training
+    for images, labels in data_loader:
+        accA += return_accuracy(modelA, images, labels, name)
+        accB += return_accuracy(modelB, images, labels, name)
+        accAxB += return_accuracy(modelAxB, images, labels, name)
+    
+    mlflow.log_metric(name + "-test-A", accA, step=step)
+    mlflow.log_metric(name + "-test-B", accB, step=step)
+    mlflow.log_metric(name + "-test-AxB", accAxB, step=step)
+
+
+
+def create_and_record_stitched_model(data_module, modelA, modelB, layerA, layerB, stitch_family, label_type, device,  init_batch_num :int, batch_bound :int, epochs :int):
     #prepare and setup data
     data_module.prepare_data()
 
@@ -104,16 +164,20 @@ def create_and_test_stitched_model(data_module, modelA, modelB, layerA, layerB, 
         reg_input.append(stitching_layer[0](modelA_(images)))
         reg_output.append(modelB_(images))
 
-        return_accuracy(modelA, images, labels, "ModelA")
-        return_accuracy(modelB, images, labels, "ModelB")
-        return_accuracy(modelAxB, images, labels, "ModelAxB")
+        #return_accuracy(modelA, images, labels, "ModelA")
+        #return_accuracy(modelB, images, labels, "ModelB")
+        #return_accuracy(modelAxB, images, labels, "ModelAxB")
     
     #applying init by regression to speed up training time
     stitching_layer[1].init_by_regression(torch.cat(reg_input), torch.cat(reg_output))
     
+    #track steps for mlflow logger
+    step = 0
+
     #freeze context for training the stitching layer
     with frozen(modelA, modelB):
-        for epoch in range(epochs):
+        
+        for epoch in tqdm(range(epochs), desc = "Stitching Layer Training over Epochs"): #iterate over the number of desired epochs
                 
             modelAxB.sl.train()
             optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.000001)
@@ -138,7 +202,8 @@ def create_and_test_stitched_model(data_module, modelA, modelB, layerA, layerB, 
                     output = modelAxB(images)
                     #print(labels)
 
-
+                    
+                    #todo: finishing implementing soft labels
                     if label_type == "soft": #soft labels
                         labels = nn.Softmax(modelA(images))
 
@@ -151,81 +216,115 @@ def create_and_test_stitched_model(data_module, modelA, modelB, layerA, layerB, 
                     optimizer.step()
 
                     #return_accuracy(modelAxB, images, labels, "ModelAxB") #sanity check to see if AxB improves 
-                    # Assert that no parameters changed *except* for stitched_model.stitching_layer
-                    for k, v in modelA.named_parameters():
-                        assert torch.allclose(v, paramsA[k])
-                    for k, v in modelB.named_parameters():
-                        assert torch.allclose(v, paramsB[k])
-                    for k, v in modelAxB.named_parameters():
-                        if k.startswith("sl"):
-                            assert not torch.allclose(v, paramsAxB[k])
-                        else:
-                            assert torch.allclose(v, paramsAxB[k])
+
+                    record_loss_metrics(modelA, modelB, loss, images, labels, "Stitching", step)
+                    step+= 1
+
+            #save modelAxB state each epoch, as well as the state of the optimizer
+            info = {"state_dict": modelAxB.state_dict(),
+                    "opt": optimizer.state_dict(),
+                    "metadata": ...}
+            save_as_artifact(info, Path("weights") / "stitching-modelAxB.pt", run_id=None)
+
+
+            '''
+            #I left this uncommented because I am unsure if it is properly completed or needed
+            #Uncomment if you want validation accuracy data, but be warned I have not gotten to test it
+            #record the validation accuracy at every epoch
+            #also could use this validation accuracy to choose when to stop training 
+            record_val_accuarcy(data_module, modelA, modelB, modelAxB, name = "Stitching", step = step)
+            '''
+
+    # Assert that no parameters changed *except* for stitched_model.stitching_layer
+    for k, v in modelA.named_parameters():
+        assert torch.allclose(v, paramsA[k])
+    for k, v in modelB.named_parameters():
+        assert torch.allclose(v, paramsB[k])
+    for k, v in modelAxB.named_parameters():
+        if k.startswith("sl"):
+            assert not torch.allclose(v, paramsAxB[k])
+        else:
+            assert torch.allclose(v, paramsAxB[k])
+    
+
 
 
     #freeze context for downstream learning
     modelAxB.sl.eval()
     with frozen(modelA, stitching_layer):
-        modelAxB.donorB.train()
+            
+        for epoch in tqdm(range(epochs), desc = "Downstream Learning over Epochs"): #iterate over the number of desired epochs
 
-        optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.000000001)
+            modelAxB.donorB.train()
+            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=0.000000001)
+                            
+            for i, (images, labels) in tqdm(enumerate(data_loader), total=batch_bound, desc= "Downstrearm Learning"): #iterate over an epoch
+            #for i, (images, labels) in tqdm(enumerate(zip(images_2,labels_2)), total=len(images_2), desc= "Downstream Learning"): #same images and labels used for the stitching layer
+                if (i == batch_bound): 
+                    break
+
+                images = images.to(device)
+                labels = labels.to(device)
                         
-        for i, (images, labels) in tqdm(enumerate(data_loader), total=batch_bound, desc= "Downstream Learning"):
-        #for i, (images, labels) in tqdm(enumerate(zip(images_2,labels_2)), total=len(images_2), desc= "Downstream Learning"): #same images and labels used for the stitching layer
-            if (i == batch_bound): 
-                break
+                optimizer.zero_grad()
+                output = modelAxB(images)
+                #print(labels)
 
-            images = images.to(device)
-            labels = labels.to(device)
-                    
-            optimizer.zero_grad()
-            output = modelAxB(images)
-            #print(labels)
+                #todo: finishing implementing soft labels
+                if label_type == "soft": #soft labels can be derrived by picking the largest value from the softmax of the logits
+                    labels = nn.Softmax(modelA(images))
 
+                                    
+                # This is task loss, but could be updated to be soft-labels to optimize match to model B
+                loss = torch.nn.functional.cross_entropy(output, labels)
 
-            #if label_type == "soft": #soft labels can be derrived by picking the largest value from the softmax of the logits
-                #labels = nn.Softmax(modelA(images))
+                
+                #backprop and adjust
+                loss.backward()
+                optimizer.step()       
 
-                                
-            # This is task loss, but could be updated to be soft-labels to optimize match to model B
-            loss = torch.nn.functional.cross_entropy(output, labels)
+                #return_accuracy(modelB, images, labels, "ModelB") #sanity check to see if AxB improves 
+                #return_accuracy(modelAxB, images, labels, "ModelAxB") #sanity check to see if AxB improves 
 
-            #backprop and adjust
-            loss.backward()
-            optimizer.step()       
+                #record loss
+                record_loss_metrics(modelA, modelB, loss, images, labels, "Downstream", step)
+                step += 1
 
-            #return_accuracy(modelB, images, labels, "ModelB") #sanity check to see if AxB improves 
-            #return_accuracy(modelAxB, images, labels, "ModelAxB") #sanity check to see if AxB improves 
+            #save modelAxB state each epoch, as well as the state of the optimizer
+            info = {"state_dict": modelAxB.state_dict(),
+                    "opt": optimizer.state_dict(),
+                    "metadata": ...}
+            save_as_artifact(info, Path("weights") / "DownsteamLearning-modelAxB.pt", run_id=None)
+
+            '''
+            #I left this uncommented because I am unsure if it is properly completed or needed
+            #Uncomment if you want validation accuracy data, but be warned I have not gotten to test it
+            #record the validation accuracy at each epoch
+            #also could use this validation accuracy to choose when to stop training 
+            record_val_accuarcy(data_module, modelA, modelB, modelAxB, name = "Stitching", step = step)
+            '''
     
 def main(dataset: str, modelA: str, modelB: str, layerA: str, layerB: str, stitch_family :str, label_type: str, epochs: int):
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     init_batch_num = 5
-    batch_bound = 100 #no bound on the number of batches, training will do a full epoch
+    batch_bound = -100 #no bound on the number of batches, training will do a full epoch
 
-    data_module = ImageNetDataModule(root_dir="/data/datasets", batch_size = 100, num_workers = 10)
-    modelA = get_pretrained_model("resnet18")
-    modelB = get_pretrained_model("resnet34")
-    layerA = "add_2"
-    layerB = "add_5"
+    #todo: implement COCO segementation 
+    data_module = ImageNetDataModule(root_dir="/data/datasets", batch_size = 100, num_workers = 10) #dataset is currently hardcoded to be imagenet
+    modelA = get_pretrained_model(modelA)
+    modelB = get_pretrained_model(modelB)
+    layerA = layerA
+    layerB = layerB
 
     stitch_family = "1x1Conv" #currently will not do anything 
-    label_type = "class"
+    label_type = "class" #currently hard coded to be class labels as soft labels are currently unsupported
 
-    epochs = 1
+    #todo implement soft labels
 
-    create_and_test_stitched_model(data_module, modelA, modelB, layerA, layerB, stitch_family, label_type, device, init_batch_num, batch_bound, epochs)
+    epochs = epochs
 
-    '''
-    # dothething
-    ...
-
-    mlflow.log_metric("loss", loss.item(), step=step)
-
-    info = {"state_dict": modelAxB.state_dict(),
-            "opt": optimizer.state_dict(),
-            "metadata": ...}
-    save_as_artifact(info, Path("weights") / "modelAxB.pt")'''
+    create_and_record_stitched_model(data_module, modelA, modelB, layerA, layerB, stitch_family, label_type, device, init_batch_num, batch_bound, epochs)
 
 
 
@@ -239,7 +338,9 @@ if __name__ == "__main__":
 
     mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
     mlflow.set_experiment("learnable--stitching")
+    
+    #print(f"{args.dataset}--{args.modelA}-{args.layerA}--x{args.stitch_family}x--{args.modelB}-{args.layerB}--label_{args.label_type}")
 
-    with mlflow.start_run(run_name=f"my fancy run {args.modelA}"):
+    with mlflow.start_run(run_name=f"{args.dataset}--{args.modelA}-{args.layerA}--x{args.stitch_family}x--{args.modelB}-{args.layerB}--label_{args.label_type}"):
         mlflow.log_params(vars(args))
         main(**vars(args))
