@@ -44,6 +44,7 @@ def display_model_graph(mdl, dpi=200):
     plt.figure(figsize=(image.shape[1] / dpi, image.shape[0] / dpi), dpi=dpi)
     plt.imshow(image)
     plt.axis("off")
+    plt.savefig("TempGrap.png")
     plt.show()
 
 
