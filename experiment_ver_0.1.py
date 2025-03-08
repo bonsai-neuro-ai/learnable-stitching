@@ -93,10 +93,6 @@ def create_and_record_stitched_model(data_module, modelA, modelB, layerA, layerB
     #prepare and setup data
     data_module.prepare_data()
 
-    #turn models into the neccessary graphmoduleplus object
-    modelA = gmp.GraphModulePlus.new_from_trace(modelA)
-    modelB = gmp.GraphModulePlus.new_from_trace(modelB)
-
     #Squashing the batch norms, so they can be frozen
     modelA = modelA.squash_all_conv_batchnorm_pairs()
     modelB = modelB.squash_all_conv_batchnorm_pairs()
@@ -304,7 +300,7 @@ def create_and_record_stitched_model(data_module, modelA, modelB, layerA, layerB
             record_val_accuarcy(data_module, modelA, modelB, modelAxB, name = "Stitching", step = step)
             '''
     
-def main(dataset: str, modelA: str, modelB: str, layerA: str, layerB: str, stitch_family :str, label_type: str, epochs: int):
+def main(dataset: str, modelA: gmp.GraphModulePlus, modelB: gmp.GraphModulePlus, layerA: str, layerB: str, stitch_family :str, label_type: str, epochs: int):
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     init_batch_num = 5
@@ -312,8 +308,7 @@ def main(dataset: str, modelA: str, modelB: str, layerA: str, layerB: str, stitc
 
     #todo: implement COCO segementation 
     data_module = ImageNetDataModule(root_dir="/data/datasets", batch_size = 100, num_workers = 10) #dataset is currently hardcoded to be imagenet
-    modelA = get_pretrained_model(modelA)
-    modelB = get_pretrained_model(modelB)
+
     layerA = layerA
     layerB = layerB
 
@@ -322,7 +317,7 @@ def main(dataset: str, modelA: str, modelB: str, layerA: str, layerB: str, stitc
 
     #todo implement soft labels
 
-    epochs = epochs
+    epochs = int(epochs)
 
     create_and_record_stitched_model(data_module, modelA, modelB, layerA, layerB, stitch_family, label_type, device, init_batch_num, batch_bound, epochs)
 
@@ -331,16 +326,68 @@ def main(dataset: str, modelA: str, modelB: str, layerA: str, layerB: str, stitc
 if __name__ == "__main__":
     import jsonargparse
 
-    parser = jsonargparse.ArgumentParser()
-    parser.add_function_arguments(main)
+    # have to create an hardcoded parser so I can set the layers properly to the add blocks in graph_module_plus
+    parser = jsonargparse.ArgumentParser(prog="learnable-stitching experiment",
+                                         description="Create an amalgam of stiched models between two given pretrained models "
+                                         + "then apply downstream learning with respect to given dataset and set label type")
+    parser.add_argument('--dataset')
+    parser.add_argument('--modelA')
+    parser.add_argument('--modelB')
+    parser.add_argument('--stitch_family')
+    parser.add_argument('--label_type')
+    parser.add_argument('--epochs')
     args = parser.parse_args()
 
+    #Models needed to be loaded prior to experiment so we can correctly extract the names of all the add layers 
+    #otherwise we may miss an add block or try to stitch to an add block that does not exist
+    str_modelA = args.modelA
+    str_modelB = args.modelB
 
-    mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
-    mlflow.set_experiment("learnable--stitching")
-    
-    #print(f"{args.dataset}--{args.modelA}-{args.layerA}--x{args.stitch_family}x--{args.modelB}-{args.layerB}--label_{args.label_type}")
+    #load pretrained models
+    modelA = get_pretrained_model(args.modelA)
+    modelB = get_pretrained_model(args.modelB)
 
-    with mlflow.start_run(run_name=f"{args.dataset}--{args.modelA}-{args.layerA}--x{args.stitch_family}x--{args.modelB}-{args.layerB}--label_{args.label_type}"):
-        mlflow.log_params(vars(args))
-        main(**vars(args))
+    #turn models into the neccessary graphmoduleplus object
+    modelA = gmp.GraphModulePlus.new_from_trace(modelA)
+    modelB = gmp.GraphModulePlus.new_from_trace(modelB)
+
+    #get split points between layers, could be much more efficient
+    layersA = []
+    layersB = []
+
+    for node in modelA.graph.nodes: #All the stitch points for modelA
+        if (node.name.count("add") > 0):
+            layersA.append(node.name)
+
+    for node in modelB.graph.nodes: #all the stitch points for modelB
+        if (node.name.count("add") > 0):
+            layersB.append(node.name)
+
+    #code to set layers to a size of 1 to speed up the process for sanity checking
+    #layersA = layersA[2:4]
+    #layersB = layersB[4:6]
+
+    #need to extend args to add layers to the dictionary to properly run the log_params function and main function
+    args_extended = vars(args)
+    args_extended["modelA"] = modelA
+    args_extended["modelB"] = modelB
+
+
+    #run an experiment for each combination of layers for each of the models
+    for layerA in layersA:
+        for layerB in layersB:
+            mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
+            mlflow.set_experiment("learnable--stitching")
+           
+            args_extended["layerA"] = layerA
+            args_extended["layerB"] = layerB
+            
+            #Debugging and sanity code
+            #The amount of sanity code I have is starting to get me to question if I truly am loose a screw or even short a few nuts and bolts
+            # Oh well, I have no time to keep contemplate, back to more programming
+            #print(vars(args))
+            #print(f"{args.dataset}--{str_modelA}_{layerA}--x{args.stitch_family}x--{str_modelB}_{layerB}--label_{args.label_type}")
+
+            with mlflow.start_run(run_name=f"{args.dataset}--{args.modelA}_{layerA}--x{args.stitch_family}x--{args.modelB}_{layerB}--label_{args.label_type}"):
+                mlflow.log_params(vars(args))
+                main(**vars(args))

@@ -17,7 +17,7 @@ def main(modelA: ModelSpec, modelB: ModelSpec, layerA: str, layerB: str, loss_ty
 
     mlflow.log_metric("loss", loss.item(), step=step)
 
-    info = {"state_dict": modelAB.state_dict(),
+    info = {"state_dict": modelAxB.state_dict(),
             "opt": optimizer.state_dict(),
             "metadata": ...}
     save_as_artifact(info, Path("weights") / "modelAB.pt")
