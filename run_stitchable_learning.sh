@@ -10,9 +10,10 @@ epochs=1 # epochs is hardcoded to 1
 for data in $datalist; do
     for modelA in $modellist; do
         for modelB in $modellist; do
+          if [ $modelA = $modelB ]; then continue; fi
             for stitch in $stitchlist; do
                 for label in $labellist; do
-                    python experiment_ver_0.1.py --dataset $data --modelA $modelA --modelB $modelB --stitch_family sf --label_type $label --epochs $epochs
+                    CUDA_VISIBLE_DEVICES=1 python experiment_ver_0.1.py --dataset $data --modelA $modelA --modelB $modelB --stitch_family sf --label_type $label --epochs $epochs
                 done
             done
         done
