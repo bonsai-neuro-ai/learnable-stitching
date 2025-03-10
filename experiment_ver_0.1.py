@@ -211,7 +211,7 @@ def create_and_record_stitched_model(
                 # print(labels)
 
                 if label_type == "soft":
-                    labels = nn.Softmax(modelB(images)).detach()
+                    labels = nn.Softmax(modelA(images)).detach()
 
                 # This is task loss, but could be updated to be soft-labels to optimize match to model B
                 loss = torch.nn.functional.cross_entropy(output, labels)
@@ -267,7 +267,7 @@ def create_and_record_stitched_model(
                 # print(labels)
 
                 if label_type == "soft":
-                    labels = nn.Softmax(modelB(images)).detach()
+                    labels = nn.Softmax(modelA(images)).detach()
 
                 loss = torch.nn.functional.cross_entropy(output, labels)
 
