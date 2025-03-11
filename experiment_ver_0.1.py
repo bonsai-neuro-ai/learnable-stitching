@@ -21,7 +21,7 @@ class ModelSpec(NamedTuple):
 def return_accuracy(model, images, labels):
     with torch.no_grad():
         output = model(images)
-    acc = torch.mean(torch.argmax(output, dim=1) == labels).item()
+    acc = torch.mean((torch.argmax(output, dim=1) == labels).float()).item()
     return acc
 
 
@@ -45,7 +45,7 @@ def record_loss_metrics(modelA, modelB, loss, images, labels, name, step):
 
 # A function that records the validation accuracy of modelA, ModelB, and their stiched modelAxB
 # Currently there does not seem to be a validation set in the dataset in nn.lib, although imagenet does have a validation set
-def record_val_accuarcy(data_module, modelA, modelB, modelAxB, name, step):
+def record_val_accuarcy(data_module, modelA, modelB, modelAxB, name, step, device):
     data_module.setup("test")
     data_loader = data_module.test_dataloader()
 
@@ -56,34 +56,14 @@ def record_val_accuarcy(data_module, modelA, modelB, modelAxB, name, step):
     # calculate the accuarcy for each batch of the evalaution data set
     # the return accurarcy function forces the gradients to be froze, so validation data should not be leaking into the training
     for images, labels in data_loader:
-        accA += return_accuracy(modelA, images, labels)
-        accB += return_accuracy(modelB, images, labels)
-        accAxB += return_accuracy(modelAxB, images, labels)
+        images, labels = images.to(device), labels.to(device)
+        accA += return_accuracy(modelA, images, labels) / len(data_loader)
+        accB += return_accuracy(modelB, images, labels) / len(data_loader)
+        accAxB += return_accuracy(modelAxB, images, labels) / len(data_loader)
 
     mlflow.log_metric(name + "-validation-A", accA, step=step)
     mlflow.log_metric(name + "-validation-B", accB, step=step)
     mlflow.log_metric(name + "-validation-AxB", accAxB, step=step)
-
-
-# A function that records the test accuracy of modelA, ModelB, and their stiched modelAxB
-def record_test_accuarcy(data_module, modelA, modelB, modelAxB, name, step):
-    data_module.setup("test")
-    data_loader = data_module.test_dataloader()
-
-    accA = 0
-    accB = 0
-    accAxB = 0
-
-    # calculate the accuarcy for each batch of the evalaution data set
-    # the return accurarcy function forces the gradients to be froze, so validation data should not be leaking into the training
-    for images, labels in data_loader:
-        accA += return_accuracy(modelA, images, labels)
-        accB += return_accuracy(modelB, images, labels)
-        accAxB += return_accuracy(modelAxB, images, labels)
-
-    mlflow.log_metric(name + "-test-A", accA, step=step)
-    mlflow.log_metric(name + "-test-B", accB, step=step)
-    mlflow.log_metric(name + "-test-AxB", accAxB, step=step)
 
 
 def create_and_record_stitched_model(
@@ -232,7 +212,7 @@ def create_and_record_stitched_model(
             }
             save_as_artifact(info, Path("weights") / "stitching-modelAxB.pt", run_id=None)
 
-            record_val_accuarcy(data_module, modelA, modelB, modelAxB, name="Stitching", step=step)
+            record_val_accuarcy(data_module, modelA, modelB, modelAxB, name="Stitching", step=step, device=device)
 
     # Assert that no parameters changed *except* for stitched_model.stitching_layer
     for k, v in modelA.named_parameters():
@@ -286,7 +266,7 @@ def create_and_record_stitched_model(
             }
             save_as_artifact(info, Path("weights") / "DownsteamLearning-modelAxB.pt", run_id=None)
 
-            record_val_accuarcy(data_module, modelA, modelB, modelAxB, name="Downstream", step=step)
+            record_val_accuarcy(data_module, modelA, modelB, modelAxB, name="Downstream", step=step, device=device)
 
 
 def main(
@@ -305,9 +285,12 @@ def main(
     batch_bound = -100  # no bound on the number of batches, training will do a full epoch
 
     # todo: implement COCO segementation
-    data_module = ImageNetDataModule(
-        root_dir="/data/datasets", batch_size=100, num_workers=10
-    )  # dataset is currently hardcoded to be imagenet
+    if dataset == "imagenet":
+        data_module = ImageNetDataModule(
+            root_dir="/data/datasets", batch_size=100, num_workers=10
+        )  # dataset is currently hardcoded to be imagenet
+    else:
+        raise ValueError("Only ImageNet supported so far")
 
     create_and_record_stitched_model(
         data_module,
