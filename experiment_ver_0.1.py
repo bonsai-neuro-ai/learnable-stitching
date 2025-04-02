@@ -1,310 +1,331 @@
+import dataclasses
+from collections import defaultdict
 from pathlib import Path
-from typing import NamedTuple
+from typing import Self
 
 import mlflow
-import nn_lib.models.fancy_layers as fl
-import nn_lib.models.graph_module_plus as gmp
 import torch
 import torch.nn as nn
-from nn_lib.datasets import ImageNetDataModule
+from graphene.utils.dataloader import DataLoader
+from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase
 from nn_lib.models import get_pretrained_model
-from nn_lib.models.utils import conv2d_shape_inverse, frozen
+from nn_lib.models.graph_module_plus import GraphModulePlus
+from nn_lib.models.utils import frozen
 from nn_lib.utils import save_as_artifact
-from tqdm.auto import tqdm, trange
+from torchmetrics import Accuracy
+from tqdm.auto import tqdm
+
+from stitching import create_stitching_layer
 
 
-class ModelSpec(NamedTuple):
-    model: str
-    dataset: str
-
-
-def return_accuracy(model, images, labels):
-    with torch.no_grad():
-        output = model(images)
-    acc = torch.mean((torch.argmax(output, dim=1) == labels).float()).item()
-    return acc
-
-
-def record_loss_metrics(modelA, modelB, loss, images, labels, name, step):
-    # record loss
-    mlflow.log_metric(name + "-loss-AxB", loss.item(), step=step)
-
-    # record loss of donors
-    outA = modelA(images)
-    lossA = torch.nn.functional.cross_entropy(outA, labels)
-    mlflow.log_metric(name + "-loss-A", lossA.item(), step=step)
-
-    outB = modelB(images)
-    lossB = torch.nn.functional.cross_entropy(outB, labels)
-    mlflow.log_metric(name + "-loss-B", lossB.item(), step=step)
-
-    # record stitching penalities
-    mlflow.log_metric(name + "-penalty-A", loss.item() - lossA.item(), step=step)
-    mlflow.log_metric(name + "-penalty-B", loss.item() - lossB.item(), step=step)
-
-
-# A function that records the validation accuracy of modelA, ModelB, and their stiched modelAxB
-# Currently there does not seem to be a validation set in the dataset in nn.lib, although imagenet does have a validation set
-def record_val_accuarcy(data_module, modelA, modelB, modelAxB, name, step, device):
-    data_module.setup("test")
-    data_loader = data_module.test_dataloader()
-
-    accA = 0
-    accB = 0
-    accAxB = 0
-
-    # calculate the accuarcy for each batch of the evalaution data set
-    # the return accurarcy function forces the gradients to be froze, so validation data should not be leaking into the training
-    for images, labels in data_loader:
-        images, labels = images.to(device), labels.to(device)
-        accA += return_accuracy(modelA, images, labels) / len(data_loader)
-        accB += return_accuracy(modelB, images, labels) / len(data_loader)
-        accAxB += return_accuracy(modelAxB, images, labels) / len(data_loader)
-
-    mlflow.log_metric(name + "-validation-A", accA, step=step)
-    mlflow.log_metric(name + "-validation-B", accB, step=step)
-    mlflow.log_metric(name + "-validation-AxB", accAxB, step=step)
-
-
-def create_and_record_stitched_model(
-    data_module,
-    modelA,
-    modelB,
-    layerA,
-    layerB,
-    stitch_family,
-    label_type,
-    device,
-    init_batch_num: int,
-    batch_bound: int,
-    epochs: int,
-):
-    # prepare and setup data
-    data_module.prepare_data()
-
-    # Squashing the batch norms, so they can be frozen
-    modelA = modelA.squash_all_conv_batchnorm_pairs()
-    modelB = modelB.squash_all_conv_batchnorm_pairs()
-
-    # Set up models on the CUDA gpus and put them in eval mode
-    modelA = modelA.to(device).eval()
-    modelB = modelB.to(device).eval()
-
-    # extract the neural network models in the subgraphs of modelA and modelB with respect to the layers
-    modelA_ = modelA.extract_subgraph(inputs=["x"], output=layerA)
-    modelB_ = modelB.extract_subgraph(inputs=["x"], output=layerB)
-    modelA_.to(device)
-    modelB_.to(device)
-
-    # dummy input needed to get the shape of subgraphs to construct the stitching layer correctly
-    dummy_input = torch.zeros(data_module.shape, device=device).unsqueeze(0)
-    dummy_a = modelA_(dummy_input)
-    dummy_b = modelB_(dummy_input)
-
-    # retrieve next node for stitching the graph
-    layerB_next = modelB._resolve_nodes(layerB)[0].users
-    layerB_next = next(iter(layerB_next)).name
-
-    # Construct the stiching layer, in the future this will be an inputed class
-    # select the in_features and out_features to be the channel dimension of the convolution dummy inputs, probably not neccessary
-    # nn.sequential requires all inputs to be nn.module, thus cannot use resize,
-    mode = "bilinear"
-    stitching_layer = nn.Sequential(
-        fl.Interpolate2d(
-            size=conv2d_shape_inverse(
-                out_shape=dummy_b.shape[-2:], kernel_size=1, stride=1, dilation=1, padding=0
-            ),
-            mode=mode,
-        ),
-        (
-            fl.RegressableConv2d(
-                in_channels=dummy_a.shape[1], out_channels=dummy_b.shape[1], kernel_size=1
-            )
-        ),
-    )
-
-    stitching_layer.to(device)
-    assert (
-        stitching_layer(dummy_a).shape == dummy_b.shape
-    )  # ensure the stiching layer is the correct size
-
-    # Stitch the stitching layer to the bottom of A_ subgraph
-    modelAxB = gmp.GraphModulePlus.new_from_merge(
-        {"donorA": modelA, "sl": stitching_layer, "donorB": modelB},
-        {"sl": ["donorA_" + layerA], "donorB_" + layerB_next: ["sl"]},
-        auto_trace=False,
-    )
-    modelAxB.to(device).eval()
-
-    # Record parameters before any training so that we can sanity-check that only the correct things
-    # are changing. The .clone() is necessary so we get a snapshot of the parameters at this point in
-    # time, rather than a reference to the parameters which will be updated later.
-    paramsA = {k: v.clone() for k, v in modelA.named_parameters()}
-    paramsB = {k: v.clone() for k, v in modelB.named_parameters()}
-    paramsAxB = {k: v.clone() for k, v in modelAxB.named_parameters()}
-
-    # prepare data to train over an epoch
-    data_module.setup("fit")
-    data_loader = data_module.train_dataloader()
-
-    # initialize the stitchig layer using regression for a training speed up
-    # initialize a couple of batches according to the init_batch
-    with torch.no_grad():
-        reg_input = []
-        reg_output = []
-        for i, (images, labels) in tqdm(
-            enumerate(data_loader),
-            total=init_batch_num,
-            desc="collecting batches for regression init",
-        ):
-            if i >= init_batch_num:
-                break
-
-            images = images.to(device)
-
-            reg_input.append(stitching_layer[0](modelA_(images)))
-            reg_output.append(modelB_(images))
-
-    # applying init by regression to speed up training time
-    stitching_layer[1].init_by_regression(torch.cat(reg_input), torch.cat(reg_output))
-    del reg_input, reg_output  # free up memory
-
-    # track steps for mlflow logger
-    step = 0
-
-    # freeze context for training the stitching layer
-    with frozen(modelA, modelB):
-
-        for epoch in trange(epochs, desc="Stitching Layer Training over Epochs"):
-
-            modelAxB.sl.train()
-            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=1e-6)
-
-            # start optimizing
-            for images, labels in tqdm(data_loader, desc="Training the Stitching Layer"):
-
-                images = images.to(device)
-                labels = labels.to(device)
-
-                optimizer.zero_grad()
-                output = modelAxB(images)
-                # print(labels)
-
-                if label_type == "soft":
-                    labels = nn.Softmax(modelA(images)).detach()
-
-                # This is task loss, but could be updated to be soft-labels to optimize match to model B
-                loss = torch.nn.functional.cross_entropy(output, labels)
-
-                # backprop and adjust
-                loss.backward()
-                optimizer.step()
-
-                # return_accuracy(modelAxB, images, labels, "ModelAxB") #sanity check to see if AxB improves
-
-                record_loss_metrics(modelA, modelB, loss, images, labels, "Stitching", step)
-                step += 1
-
-            # save modelAxB state each epoch, as well as the state of the optimizer
-            info = {
-                "state_dict": modelAxB.state_dict(),
-                "opt": optimizer.state_dict(),
-            }
-            save_as_artifact(info, Path("weights") / "stitching-modelAxB.pt", run_id=None)
-
-            record_val_accuarcy(data_module, modelA, modelB, modelAxB, name="Stitching", step=step, device=device)
-
-    # Assert that no parameters changed *except* for stitched_model.stitching_layer
-    for k, v in modelA.named_parameters():
-        assert torch.allclose(v, paramsA[k])
-    for k, v in modelB.named_parameters():
-        assert torch.allclose(v, paramsB[k])
-    for k, v in modelAxB.named_parameters():
-        if k.startswith("sl"):
-            assert not torch.allclose(v, paramsAxB[k])
-        else:
-            assert torch.allclose(v, paramsAxB[k])
-
-    # freeze context for downstream learning
-    modelAxB.sl.eval()
-    with frozen(modelA, stitching_layer):
-        for images, labels in tqdm(data_loader, desc="Training the Downstream Model"):
-
-            modelAxB.donorB.train()
-            optimizer = torch.optim.Adam(modelAxB.parameters(), lr=1e-8)
-
-            for i, (images, labels) in tqdm(
-                enumerate(data_loader), total=batch_bound, desc="Downstrearm Learning"
-            ):
-                if i == batch_bound:
-                    break
-
-                images = images.to(device)
-                labels = labels.to(device)
-
-                optimizer.zero_grad()
-                output = modelAxB(images)
-                # print(labels)
-
-                if label_type == "soft":
-                    labels = nn.Softmax(modelA(images)).detach()
-
-                loss = torch.nn.functional.cross_entropy(output, labels)
-
-                # backprop and adjust
-                loss.backward()
-                optimizer.step()
-
-                # record loss
-                record_loss_metrics(modelA, modelB, loss, images, labels, "Downstream", step)
-                step += 1
-
-            # save modelAxB state each epoch, as well as the state of the optimizer
-            info = {
-                "state_dict": modelAxB.state_dict(),
-                "opt": optimizer.state_dict(),
-            }
-            save_as_artifact(info, Path("weights") / "DownsteamLearning-modelAxB.pt", run_id=None)
-
-            record_val_accuarcy(data_module, modelA, modelB, modelAxB, name="Downstream", step=step, device=device)
-
-
-def main(
-    dataset: str,
-    modelA: gmp.GraphModulePlus,
-    modelB: gmp.GraphModulePlus,
-    layerA: str,
-    layerB: str,
-    stitch_family: str = "1x1Conv",
-    label_type: str = "class",
-    epochs: int = 1,
-):
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    init_batch_num = 5
-    batch_bound = -100  # no bound on the number of batches, training will do a full epoch
-
-    # todo: implement COCO segementation
-    if dataset == "imagenet":
-        data_module = ImageNetDataModule(
-            root_dir="/data/datasets", batch_size=100, num_workers=10
-        )  # dataset is currently hardcoded to be imagenet
+def _get_dataset_by_name(name: str) -> TorchvisionDataModuleBase:
+    # todo: implement other datasets
+    if name == "imagenet":
+        dm = ImageNetDataModule(root_dir="/data/datasets")
     else:
         raise ValueError("Only ImageNet supported so far")
+    dm.prepare_data()
+    return dm
 
-    create_and_record_stitched_model(
-        data_module,
-        modelA,
-        modelB,
-        layerA,
-        layerB,
-        stitch_family,
-        label_type,
-        device,
-        init_batch_num,
-        batch_bound,
-        epochs,
+
+def _get_pretrained_model_by_name(name: str) -> GraphModulePlus:
+    torchvision_model = get_pretrained_model(name)
+    return GraphModulePlus.new_from_trace(torchvision_model).squash_all_conv_batchnorm_pairs()
+
+
+@dataclasses.dataclass
+class DonorSpec:
+    model: str | GraphModulePlus
+    layer: str
+    dataset: str | TorchvisionDataModuleBase
+
+    def maybe_initialize(self) -> Self:
+        if isinstance(self.model, str):
+            self.model = _get_pretrained_model_by_name(self.model)
+        if isinstance(self.dataset, str):
+            self.dataset = _get_dataset_by_name(self.dataset)
+        return self
+
+
+def create_hybrid_model(
+    donorA: DonorSpec, donorB: DonorSpec, stitch_family: str
+) -> tuple[GraphModulePlus, GraphModulePlus, GraphModulePlus]:
+    """Initializes a stitched model, inferring the shapes of the layers to be stitched.
+
+    :param donorA: A DonorSpec object representing the upstream model & layer to be stitched.
+    :param donorB: A DonorSpec object representing the downstream model & layer to be stitched.
+    :param stitch_family: A string passed to create_stitching_layer specifying the type of
+        stitching layer.
+    :return: A tuple of
+        - modelAxB: The stitched model.
+        - donorA_embedding_getter: A GraphModulePlus object for extracting embeddings from donorA.
+        - donorB_embedding_getter: A GraphModulePlus object for extracting embeddings from donorB.
+    """
+    # Set up models and data if not already initialized
+    donorA.maybe_initialize()
+    donorB.maybe_initialize()
+
+    # Run dummy data through modelA up to layerA to get its shape
+    donorA_embedding_getter = GraphModulePlus.new_from_copy(donorA.model).set_output(donorA.layer)
+    dataA_shape = donorA.dataset.shape
+    repA_shape = donorA_embedding_getter(torch.zeros((1,) + dataA_shape)).shape
+
+    # Run dummy data through modelB up to layerB to get its shape
+    donorB_embedding_getter = GraphModulePlus.new_from_copy(donorB.model).set_output(donorB.layer)
+    dataB_shape = donorB.dataset.shape
+    repB_shape = donorB_embedding_getter(torch.zeros((1,) + dataB_shape)).shape
+
+    # Initialize the stitching layer
+    stitching_layer = create_stitching_layer(repA_shape[1:], repB_shape[1:], stitch_family)
+
+    # sanity-check that the stiching layer is the correct size
+    assert stitching_layer(torch.zeros(repA_shape)).shape == repB_shape
+
+    # retrieve next node for stitching the graph
+    layerB_next = donorB.model.users_of(donorB.layer)
+    assert len(layerB_next) == 1, "Stitching layers with |users| != 1 not supported"
+    layerB_next = layerB_next[0].name
+
+    # Stitch the stitching layer to the bottom of A_ subgraph
+    modelAxB = GraphModulePlus.new_from_merge(
+        {"donorA": donorA.model, "stitching_layer": stitching_layer, "donorB": donorB.model},
+        {
+            "stitching_layer": ["donorA_" + donorA.layer],
+            "donorB_" + layerB_next: ["stitching_layer"],
+        },
+        auto_trace=False,
     )
+
+    return modelAxB, donorA_embedding_getter, donorB_embedding_getter
+
+
+def run_analysis(
+    donorA: DonorSpec,
+    donorB: DonorSpec,
+    stitch_family: str,
+    label_type: str,
+    init_batches: int,
+    downstream_batches: int,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device | str,
+):
+    # Set up models and data if not already initialized
+    donorA.maybe_initialize()
+    donorB.maybe_initialize()
+    modelAxB, embedding_getter_A, embedding_getter_B = create_hybrid_model(
+        donorA, donorB, stitch_family
+    )
+
+    # Ensure all models are in eval mode and on device
+    modelA = donorA.model.eval().to(device)
+    modelB = donorB.model.eval().to(device)
+    modelAxB = modelAxB.eval().to(device)
+
+    # Get dataloaders
+    donorA.dataset.setup("fit")
+    train_data = donorA.dataset.train_dataloader(batch_size=batch_size, num_workers=num_workers)
+
+    donorA.dataset.setup("val")
+    val_data = donorA.dataset.val_dataloader(batch_size=batch_size, num_workers=num_workers)
+
+    @torch.no_grad()
+    def snapshot_and_validate(prefix: str):
+        """Snapshot params and run validation."""
+        nonlocal modelA, modelB, modelAxB, val_data
+        # Saving all three models so we can run sanity-checks later that only the parameters we
+        # wanted to change actually changed in each phase.
+        save_as_artifact(modelAxB.state_dict(), Path("weights") / f"{prefix}-modelAxB.pt")
+        save_as_artifact(modelA.state_dict(), Path("weights") / f"{prefix}-modelA.pt")
+        save_as_artifact(modelB.state_dict(), Path("weights") / f"{prefix}-modelB.pt")
+
+        models = {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB}
+        metrics = {
+            "acc1": Accuracy("multiclass", num_classes=donorB.dataset.num_classes, top_k=1).to(
+                device
+            ),
+            "acc5": Accuracy("multiclass", num_classes=donorB.dataset.num_classes, top_k=5).to(
+                device
+            ),
+            "loss": nn.functional.cross_entropy,
+        }
+        values = defaultdict(lambda: torch.zeros(1, device=device))
+        for im, la in tqdm(val_data, desc=f"Validating[{prefix}]", total=len(val_data)):
+            im, la = im.to(device), la.to(device)
+            for model_name, model in models.items():
+                out = model(im)
+                for metric_name, metric_fn in metrics.items():
+                    values[f"{prefix}-{model_name}-val-{metric_name}"] += metric_fn(out, la)
+
+        # Average the values over the number of batches and log to mlflow
+        values = {k: v.item() / len(val_data) for k, v in values.items()}
+        mlflow.log_metrics(values)
+
+    # Snapshot everything before doing any training
+    snapshot_and_validate("init")
+
+    # Phase zero: regression-based initialization
+    run_regression_init(
+        modelAxB, embedding_getter_A, embedding_getter_B, train_data, init_batches, device
+    )
+    snapshot_and_validate("regression")
+
+    # Phase 1: Train the stitching layer to convergence
+    max_steps_part_1 = int(2 * len(train_data.dataset) / batch_size)
+    train_stitching_layer_to_convergence(
+        modelAxB=modelAxB,
+        modelA=modelA,
+        modelB=modelB,
+        train_data=train_data,
+        label_type=label_type,
+        device=device,
+        max_steps=max_steps_part_1,
+    )
+    snapshot_and_validate("stitching")
+
+    # Phase 2: Train the downstream model
+    train_downstream_model(
+        modelAxB=modelAxB,
+        modelA=modelA,
+        modelB=modelB,
+        train_data=train_data,
+        label_type=label_type,
+        device=device,
+        max_steps=downstream_batches,
+        init_step=max_steps_part_1 + 1,
+    )
+    snapshot_and_validate("downstream")
+
+
+def train_downstream_model(
+    modelAxB: GraphModulePlus,
+    modelA: GraphModulePlus,
+    modelB: GraphModulePlus,
+    train_data: DataLoader,
+    label_type: str,
+    device: str | torch.device,
+    max_steps: int,
+    init_step: int,
+):
+    modelA.eval()
+    modelAxB.eval()
+    modelB.train()
+    optimizer = torch.optim.Adam(modelB.parameters(), lr=1e-8)
+    with frozen(modelA, modelAxB.stitching_layer):
+        for i, (im, la) in enumerate(tqdm(train_data, total=max_steps, desc="Fine-tuning")):
+            if i == max_steps:
+                break
+
+            optimizer.zero_grad()
+            im, la = im.to(device), la.to(device)
+            output = modelAxB(im)
+            target = _soft_target_helper(im, la, modelA, modelB, label_type)
+            loss = torch.nn.functional.cross_entropy(output, target)
+            loss.backward()
+            optimizer.step()
+
+            mlflow.log_metric("train_loss", loss.detach(), step=init_step + i)
+
+
+def train_stitching_layer_to_convergence(
+    modelAxB: GraphModulePlus,
+    modelA: GraphModulePlus,
+    modelB: GraphModulePlus,
+    train_data: DataLoader,
+    label_type: str,
+    device: str | torch.device,
+    max_steps: int,
+    parameter_convergence_eps: float = 1e-4,
+):
+    modelA.eval()
+    modelB.eval()
+    modelAxB.stitching_layer.train()
+    optimizer = torch.optim.Adam(modelAxB.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.1)
+    converged = False
+
+    with frozen(modelA, modelB):
+        step = 0
+        last_params = {
+            k: v.detach().clone() for k, v in modelAxB.stitching_layer.state_dict().items()
+        }
+        while not converged:
+            for im, la in train_data:
+                optimizer.zero_grad()
+                im, la = im.to(device), la.to(device)
+                output = modelAxB(im)
+                target = _soft_target_helper(im, la, modelA, modelB, label_type)
+                loss = torch.nn.functional.cross_entropy(output, target)
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                new_params = {
+                    k: v.detach().clone() for k, v in modelAxB.stitching_layer.state_dict().items()
+                }
+                with torch.no_grad():
+                    delta_params = torch.tensor(
+                        [
+                            (new_p - last_p).abs().max()
+                            for new_p, last_p in zip(new_params.values(), last_params.values())
+                        ]
+                    ).max()
+                    last_params = new_params
+
+                if delta_params < parameter_convergence_eps:
+                    converged = True
+
+                if converged or step >= max_steps:
+                    break
+
+                mlflow.log_metric("train_loss", loss.detach(), step=step)
+                mlflow.log_metric("delta_params", delta_params.detach(), step=step)
+
+                step += 1
+
+    mlflow.log_metric("steps to train stitching layer", step)
+    mlflow.log_metric("stitching layer converged", converged)
+
+
+@torch.no_grad()
+def run_regression_init(
+    modelAxB: GraphModulePlus,
+    embedding_getter_A: GraphModulePlus,
+    embedding_getter_B: GraphModulePlus,
+    train_data: DataLoader,
+    init_batches: int,
+    device: str | torch.device,
+):
+    reg_input = []
+    reg_output = []
+    for i, (im, la) in enumerate(tqdm(train_data, total=init_batches, desc="Regression init")):
+        if i >= init_batches:
+            break
+
+        im = im.to(device)
+        reg_input.append(embedding_getter_A(im))
+        reg_output.append(embedding_getter_B(im))
+
+    # applying init by regression to speed up training time
+    modelAxB.stitching_layer.init_by_regression(
+        from_data=torch.cat(reg_input, dim=0),
+        to_data=torch.cat(reg_output, dim=0),
+    )
+
+
+def _soft_target_helper(images, labels, modelA, modelB, loss_type: str):
+    if loss_type == "class":
+        return labels
+    elif loss_type == "soft-A":
+        with torch.no_grad():
+            return torch.softmax(modelA(images), dim=-1)
+    elif loss_type == "soft-B":
+        raise NotImplementedError(
+            "Soft targets for modelB not implemented. Tricky because we need to be careful if B"
+            " is changing while we train AxB!"
+        )
+    else:
+        raise ValueError("Invalid loss type")
 
 
 if __name__ == "__main__":
@@ -319,46 +340,34 @@ if __name__ == "__main__":
     # TODO defaults and help messages (maybe jsonargparse?)
     parser.add_argument("--modelA")
     parser.add_argument("--modelB")
-    parser.add_argument("--dataset", default="imagenet", type=str)
+    parser.add_argument("--datasetA", default="imagenet", type=str)
+    parser.add_argument("--datasetB", default="imagenet", type=str)
     parser.add_argument("--stitch_family", default="1x1Conv", type=str)
     parser.add_argument("--label_type", default="class", type=str)
-    parser.add_argument("--epochs", default=1, type=int)
+    parser.add_argument("--init_batches", default=10, type=int)
+    parser.add_argument("--downstream_batches", default=100, type=int)
+    parser.add_argument("--batch_size", default=200, type=int)
+    parser.add_argument("--num_workers", default=20, type=int)
+    parser.add_argument("--device", default="cuda", type=torch.device)
     args = parser.parse_args()
 
-    # Models needed to be loaded prior to experiment so we can correctly extract the names of all
-    # the add layers otherwise we may miss an add block or try to stitch to an add block that
-    # does not exist
-    str_modelA = args.modelA
-    str_modelB = args.modelB
+    mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
+    mlflow.set_experiment("learnable--stitching-DEBUG")
 
-    # load pretrained models
-    modelA = get_pretrained_model(args.modelA)
-    modelB = get_pretrained_model(args.modelB)
+    donorA = DonorSpec(args.modelA, "", args.datasetA).maybe_initialize()
+    donorB = DonorSpec(args.modelB, "", args.datasetB).maybe_initialize()
 
-    # turn models into the neccessary graphmoduleplus object
-    modelA = gmp.GraphModulePlus.new_from_trace(modelA)
-    modelB = gmp.GraphModulePlus.new_from_trace(modelB)
-
-    # get split points between layers, could be much more efficient
-    layersA = []
-    layersB = []
-
-    for node in modelA.graph.nodes:  # All the stitch points for modelA
-        if node.name.count("add") > 0:
-            layersA.append(node.name)
-
-    for node in modelB.graph.nodes:  # all the stitch points for modelB
-        if node.name.count("add") > 0:
-            layersB.append(node.name)
+    layersA = [l.name for l in donorA.model.graph.nodes if l.name.count("add") > 0]
+    layersB = [l.name for l in donorB.model.graph.nodes if l.name.count("add") > 0]
 
     # run an experiment for each combination of layers for each of the models
     for layerA in layersA:
         for layerB in layersB:
-            mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
-            mlflow.set_experiment("learnable--stitching")
+            donorA.layer = layerA
+            donorB.layer = layerB
 
             with mlflow.start_run(
-                run_name=f"{args.dataset}--{args.modelA}_{layerA}--x{args.stitch_family}x--{args.modelB}_{layerB}--label_{args.label_type}"
+                run_name=f"{args.modelA}_{layerA}--x{args.stitch_family}x--{args.modelB}_{layerB}--label_{args.label_type}"
             ):
                 mlflow.log_params(
                     {
@@ -367,13 +376,15 @@ if __name__ == "__main__":
                         **vars(args),
                     }
                 )
-                main(
-                    dataset=args.dataset,
-                    modelA=modelA,
-                    modelB=modelB,
-                    layerA=layerA,
-                    layerB=layerB,
+
+                run_analysis(
+                    donorA=donorA,
+                    donorB=donorB,
                     stitch_family=args.stitch_family,
                     label_type=args.label_type,
-                    epochs=args.epochs,
+                    init_batches=args.init_batches,
+                    downstream_batches=args.downstream_batches,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    device=args.device,
                 )
