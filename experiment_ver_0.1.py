@@ -352,20 +352,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
-    mlflow.set_experiment("learnable--stitching-DEBUG")
+    mlflow.set_experiment("learnable--stitching")
 
-    donorA = DonorSpec(args.modelA, "", args.datasetA).maybe_initialize()
-    donorB = DonorSpec(args.modelB, "", args.datasetB).maybe_initialize()
+    tmpA = _get_pretrained_model_by_name(args.modelA)
+    tmpB = _get_pretrained_model_by_name(args.modelA)
 
-    layersA = [l.name for l in donorA.model.graph.nodes if l.name.count("add") > 0]
-    layersB = [l.name for l in donorB.model.graph.nodes if l.name.count("add") > 0]
+    layersA = [l.name for l in tmpA.graph.nodes if l.name.count("add") > 0]
+    layersB = [l.name for l in tmpB.graph.nodes if l.name.count("add") > 0]
 
     # run an experiment for each combination of layers for each of the models
     for layerA in layersA:
         for layerB in layersB:
-            donorA.layer = layerA
-            donorB.layer = layerB
-
             with mlflow.start_run(
                 run_name=f"{args.modelA}_{layerA}--x{args.stitch_family}x--{args.modelB}_{layerB}--label_{args.label_type}"
             ):
@@ -378,8 +375,8 @@ if __name__ == "__main__":
                 )
 
                 run_analysis(
-                    donorA=donorA,
-                    donorB=donorB,
+                    donorA=DonorSpec(args.modelA, layerA, args.datasetA),
+                    donorB=DonorSpec(args.modelB, layerB, args.datasetB),
                     stitch_family=args.stitch_family,
                     label_type=args.label_type,
                     init_batches=args.init_batches,
