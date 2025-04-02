@@ -317,9 +317,9 @@ if __name__ == "__main__":
         + "then apply downstream learning with respect to given dataset and set label type",
     )
     # TODO defaults and help messages (maybe jsonargparse?)
-    parser.add_argument("--dataset")
     parser.add_argument("--modelA")
     parser.add_argument("--modelB")
+    parser.add_argument("--dataset", default="imagenet", type=str)
     parser.add_argument("--stitch_family", default="1x1Conv", type=str)
     parser.add_argument("--label_type", default="class", type=str)
     parser.add_argument("--epochs", default=1, type=int)
