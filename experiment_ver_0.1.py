@@ -11,7 +11,7 @@ from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase
 from nn_lib.models import get_pretrained_model
 from nn_lib.models.graph_module_plus import GraphModulePlus
 from nn_lib.models.utils import frozen
-from nn_lib.utils import save_as_artifact
+from nn_lib.utils import save_as_artifact, search_runs_by_params
 from torchmetrics import Accuracy
 from tqdm.auto import tqdm
 
@@ -354,15 +354,20 @@ if __name__ == "__main__":
     mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
     mlflow.set_experiment("learnable--stitching")
 
+    prior_runs = search_runs_by_params("learnable--stitching", params=vars(args), finished_only=True)
+
     tmpA = _get_pretrained_model_by_name(args.modelA)
     tmpB = _get_pretrained_model_by_name(args.modelA)
 
     layersA = [l.name for l in tmpA.graph.nodes if l.name.count("add") > 0]
     layersB = [l.name for l in tmpB.graph.nodes if l.name.count("add") > 0]
-
     # run an experiment for each combination of layers for each of the models
     for layerA in layersA:
         for layerB in layersB:
+            # check if this combination has already been run
+            if not prior_runs.empty and any((prior_runs["params.layerA"] == layerA) & (prior_runs["params.layerB"] == layerB)):
+                print(f"Already run {args.modelA} {layerA} -- {args.modelB} {layerB}")
+                continue
             with mlflow.start_run(
                 run_name=f"{args.modelA}_{layerA}--x{args.stitch_family}x--{args.modelB}_{layerB}--label_{args.label_type}"
             ):
