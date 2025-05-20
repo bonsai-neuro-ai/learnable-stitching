@@ -1,22 +1,31 @@
-#!/bin/sh
-# lists for the different knobs to turn for the experiments, node the deeplab models were pretrained for coco segementation"
-datalist='imagenet'
-modellist='resnet18 resnet34 resnet50 resnet101'
+#!/usr/bin/env bash
+MODELS=(
+  "resnet18"
+  "resnet34"
+  "resnet50"
+)
 
-stitchlist="conv1x1" # currently hardcoded to be the 1x1 stitching layer
-labellist="class" # soft labels wiil be added eventually
-epochs=1 # epochs is hardcoded to 1
-
-for data in $datalist; do
-    for modelA in $modellist; do
-        for modelB in $modellist; do
-          if [ $modelA = $modelB ]; then continue; fi
-            for stitch in $stitchlist; do
-                for label in $labellist; do
-                    CUDA_VISIBLE_DEVICES=1 python experiment_ver_0.1.py --dataset $data --modelA $modelA --modelB $modelB --stitch_family sf --label_type $label --epochs $epochs
-                done
-            done
+for MODELA in "${MODELS[@]}"; do
+  LAYERSA=($(python -m model_info $MODELA --layers | grep "add"))
+  for MODELB in "${MODELS[@]}"; do
+    if [ "$MODELA" = "$MODELB" ]; then continue; fi
+    LAYERSB=($(python -m model_info $MODELB --layers | grep "add"))
+    for LAYERA in "${LAYERSA[@]}"; do
+      for LAYERB in "${LAYERSA[@]}"; do
+        CUDA_VISIBLE_DEVICES=0 python experiment_ver_0.2.py \
+          --donorA.model="$MODELA" \
+          --donorA.layer="$LAYERA" \
+          --donorA.dataset="imagenet" \
+          --donorB.model="$MODELB" \
+          --donorB.layer="$LAYERB" \
+          --donorB.dataset="imagenet" \
+          --stitch_family="1x1Conv" \
+          --target_type=TASK \
+          --init_batches=10 \
+          --downstream_batches=500 \
+          --batch_size=200 \
+          --num_workers=4
         done
-    done
+      done
+  done
 done
-
