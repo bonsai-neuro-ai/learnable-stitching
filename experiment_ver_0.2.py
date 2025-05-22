@@ -8,6 +8,10 @@ from typing import Self, assert_never
 import mlflow
 import torch
 import torch.nn as nn
+
+import importlib  
+#nn_lib = importlib.import_module("bonsai-nn-library")
+
 from graphene.utils.dataloader import DataLoader
 from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase
 from nn_lib.models import get_pretrained_model
@@ -156,6 +160,10 @@ def snapshot_and_test(models, val_data, prefix, num_classes, device):
             out = model(im)
             for metric_name, metric_fn in metrics.items():
                 values[f"{prefix}-{model_name}-val-{metric_name}"] += metric_fn(out, la)
+
+            #keeping track of cross entropy to donor models for sanity checking that the data is trending correctly
+            values[f"{prefix}-{model_name}-sanity-upstream_ce"] += nn.functional.cross_entropy(out, models["modelA"])
+            values[f"{prefix}-{model_name}-sanity-upstream_ce"] += nn.functional.cross_entropy(out, models["modelB"])
 
     # Average the values over the number of batches and log to mlflow
     values = {k: v.item() / len(val_data) for k, v in values.items()}
@@ -414,7 +422,7 @@ if __name__ == "__main__":
     parser.add_function_arguments(run_analysis)
     args = parser.parse_args()
 
-    experiment_name = "learnable-stitching-v0.2"
+    experiment_name = "learnable-stitching-v0.2-tests"
     mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
     mlflow.set_experiment(experiment_name)
 
@@ -423,7 +431,7 @@ if __name__ == "__main__":
         experiment_name=experiment_name,
         finished_only=True,
         params=_flatten_dict(args.as_dict()),
-        skip_fields={"device": ..., "num_workers": ...},
+        ignore={"device": ..., "num_workers": ...},
     )
     if not prior_runs.empty:
         print("Experiment already run with these parameters. Exiting.")
