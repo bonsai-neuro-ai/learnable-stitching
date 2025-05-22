@@ -170,3 +170,10 @@ TempGrap.png
 
 #tutorial file
 logger_example
+
+#graph
+*.png
+*.svg
+
+#random output file used for sanity checking and debugging 
+debug.txt
