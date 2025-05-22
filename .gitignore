@@ -177,3 +177,6 @@ logger_example
 
 #random output file used for sanity checking and debugging 
 debug.txt
+
+#data files
+big_df.csv
