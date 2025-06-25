@@ -35,7 +35,7 @@ class ConvStitchingLayer(nn.Module, fl.Regressable):
         return self.conv(self.maybe_resize(x))
 
     def init_by_regression(
-        self, from_data: torch.Tensor, to_data: torch.Tensor, transpose: bool = False
+        self, from_data: torch.Tensor, to_data: torch.Tensor
     ) -> Self:
         """
         Initialize the convolutional layer by regression.
@@ -44,8 +44,14 @@ class ConvStitchingLayer(nn.Module, fl.Regressable):
         :param transpose: Whether to transpose the regression (optimize to->from).
         :return: Self.
         """
-        self.conv.init_by_regression(self.maybe_resize(from_data), to_data, transpose=transpose)
+        self.conv.init_by_regression(self.maybe_resize(from_data), to_data)
         return self
+
+    def _prep_regressors(self, from_data, to_data):
+        return self.conv._prep_regressors(self.maybe_resize(from_data), to_data)
+    
+    def _set_regression_results(self, weight, bias):
+        return self.conv._set_regression_results(weight, bias)
 
 
 def create_stitching_layer(
