@@ -17,7 +17,7 @@ for MODELA in "${MODELS[@]}"; do
     if [ "$MODELA" = "$MODELB" ]; then continue; fi
     LAYERSB=($(python3 -m model_info $MODELB --layers | grep "add"))
     for LAYERA in "${LAYERSA[@]}"; do
-      for LAYERB in "${LAYERSA[@]}"; do
+      for LAYERB in "${LAYERSB[@]}"; do
         for TARGET in "${TARGETS[@]}"; do
           CUDA_VISIBLE_DEVICES=0 python3 experiment_ver_0.2.py \
             --donorA.model="$MODELA" \
