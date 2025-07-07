@@ -2,7 +2,7 @@ import dataclasses
 from collections import defaultdict
 from enum import Enum, auto
 from pathlib import Path
-from typing import Self, assert_never
+from typing import Self, assert_never, Literal
 
 import mlflow
 import torch
@@ -13,6 +13,7 @@ from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase
 from nn_lib.models import get_pretrained_model
 from nn_lib.models.graph_module_plus import GraphModulePlus
 from nn_lib.models.utils import frozen
+from nn_lib.optim import LRFinder
 from nn_lib.utils import save_as_artifact, search_runs_by_params
 from torchmetrics import Accuracy
 from tqdm.auto import tqdm
@@ -200,7 +201,7 @@ def run_analysis(
     stitch_family: str,
     target_type: TargetType,
     init_batches: int,
-    stitching_lr: float = 1e-3,
+    stitching_lr: float | Literal["auto"] = "auto",
     downstream_lr: float = 1e-5,
     downstream_batches: int = 1000,
     batch_size: int = 200,
@@ -387,7 +388,7 @@ def train_stitching_layer_to_convergence(
     train_data: DataLoader,
     target_type: TargetType,
     max_steps: int,
-    lr: float,
+    lr: float | Literal["auto"] = "auto",
     lr_time_constant: float = 100.0,
     parameter_convergence_eps: float = 1e-4,
     device: str | torch.device = "cuda",
@@ -395,6 +396,24 @@ def train_stitching_layer_to_convergence(
     modelA.eval()
     modelB.eval()
     modelAxB.stitching_layer.train()
+
+    if lr == "auto":
+        optim = torch.optim.Adam(modelAxB.stitching_layer.parameters(), lr=1e-6)
+        lr_finder = LRFinder(
+            modelAxB, optim, criterion=torch.nn.CrossEntropyLoss(), device=device
+        )
+        lr_finder.range_test(
+            train_data,
+            1e-9,
+            1e-1,
+            num_iter=100,
+            callback=lambda itr, lr, loss: mlflow.log_metrics(
+                {"lr-finder-lr": lr, "lr-finder-loss": loss}, step=itr
+            ),
+        )
+        lr = lr_finder.suggestion(stability_check=False)
+
+    mlflow.log_metric("init lr", lr)
     optimizer = torch.optim.Adam(modelAxB.stitching_layer.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda step: 1 / (1 + step / lr_time_constant)
