@@ -1,12 +1,9 @@
 import dataclasses
-import io
 from collections import defaultdict
 from enum import Enum, auto
 from pathlib import Path
 from typing import Self, assert_never
 
-import matplotlib.image as mpimg
-import matplotlib.pyplot as plt
 import mlflow
 import torch
 import torch.fx.graph
@@ -21,17 +18,6 @@ from torchmetrics import Accuracy
 from tqdm.auto import tqdm
 
 from stitching import create_stitching_layer
-
-
-def display_model_graph(mdl, dpi=200):
-    image = mdl.to_dot().create_png(prog="dot")
-    with io.BytesIO(image) as f:
-        image = mpimg.imread(f)
-    plt.figure(figsize=(image.shape[1] / dpi, image.shape[0] / dpi), dpi=dpi)
-    plt.imshow(image)
-    plt.axis("off")
-    plt.savefig("TempGrap.png")
-    plt.show()
 
 
 def _get_pretrained_model_by_name(model_name: str) -> GraphModulePlus:
@@ -124,14 +110,20 @@ def create_hybrid_model(
     )
 
     image = modelAxB.to_dot().create_png(prog="dot")
-    with open("/tmp/hybrid-model.png", "wb") as f:
+    with open(mlflow.get_artifact_uri("hybrid-model.png"), "wb") as f:
         f.write(image)
-    mlflow.log_artifact("/tmp/hybrid-model.png", "hybrid-model.png")
 
     return modelAxB, donorA_embedding_getter, donorB_embedding_getter
 
 
-def loss_metrics_helper(target_type, modelAxB, modelA, modelB, im, la):
+def loss_metrics_helper(
+    target_type: TargetType,
+    modelAxB: nn.Module,
+    modelA: nn.Module,
+    modelB: nn.Module,
+    im: torch.Tensor,
+    la: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Helper function to compute loss and metrics for the given target type."""
 
     out = modelAxB(im)
@@ -208,13 +200,9 @@ def run_analysis(
     donorA.maybe_initialize()
     donorB.maybe_initialize()
 
-    init_modelB = donorB.model
     modelAxB, embedding_getter_A, embedding_getter_B = create_hybrid_model(
         donorA, donorB, stitch_family
     )
-
-    after_hubrid_modelB = donorB.model
-    display_model_graph(after_hubrid_modelB)
 
     # Ensure all models are in eval mode and on device
     modelA = donorA.model.eval().to(device)
@@ -244,6 +232,7 @@ def run_analysis(
         donorB.dataset.num_classes,
         device,
     )
+
     # Phase 1: Train the stitching layer to convergence
     train_stitching_layer_to_convergence(
         modelAxB=modelAxB,
@@ -282,19 +271,6 @@ def run_analysis(
         donorB.dataset.num_classes,
         device,
     )
-
-
-# A quick and dirty way to make a deepcopy of a module without using deepcopy, as deepcopy is finicky
-# with c extentions from python
-# TO DO, replace this method with a better one if so desired,
-# TO DO, could not even get this to work, dear lord, pytorch is messy
-def save_n_load(model: GraphModulePlus):
-    temp_file = "temp_model.pth"
-    torch.save(model.state_dict(), temp_file)
-    copied_module = torch.fx.GraphModule(nn.Module(), torch.fx.graph())
-    copied_module.load_state_dict(torch.load(temp_file))
-
-    return GraphModulePlus.new_from_copy(copied_module)
 
 
 def train_downstream_model(
@@ -391,7 +367,7 @@ def train_stitching_layer_to_convergence(
     modelA.eval()
     modelB.eval()
     modelAxB.stitching_layer.train()
-    optimizer = torch.optim.Adam(modelAxB.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(modelAxB.stitching_layer.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda step: 1 / (1 + step / lr_time_constant)
     )
