@@ -143,13 +143,28 @@ def loss_metrics_helper(
     return loss, task_acc, task_ce
 
 
+def _hash_tensor(tensor: torch.Tensor) -> float:
+    """Returns a hash of the tensor, where, by 'hash' we just mean the floating point sum. We move
+    values to CPU to make sure it is deterministic.
+    """
+    return tensor.detach().cpu().numpy().sum() if tensor is not None else 0.0
+
+
 @torch.no_grad()
-def snapshot_and_test(models, val_data, prefix, num_classes, device):
+def snapshot_and_test(hashes, models, val_data, prefix, num_classes, device):
     """Snapshot params and run validation."""
     # Saving all three models so we can run sanity-checks later that only the parameters we
     # wanted to change actually changed in each phase.
     for name, model in models.items():
-        save_as_artifact(model.state_dict(), Path("weights") / f"{prefix}-{name}.pt")
+        # Only record the keys of the state dict that have changed from the donor model. This
+        # is like what we would get if we had used GraphModulePlus.delta_state_dict(), but by doing
+        # it with hashes we save on space. Load these snapshots using
+        # GraphModulePlus.load_delta_state_dict() and the original donor model.
+        sd_hash = hashes[name]
+        delta_state_dict = {
+            k: v for k, v in model.state_dict().items() if _hash_tensor(v) != sd_hash[k]
+        }
+        save_as_artifact(delta_state_dict, Path("weights") / f"{prefix}-{name}.pt")
 
     metrics = {
         "acc1": Accuracy("multiclass", num_classes=num_classes, top_k=1).to(device),
@@ -204,6 +219,16 @@ def run_analysis(
         donorA, donorB, stitch_family
     )
 
+    # Get a hash of each parameter of each model so that later we can ensure that we only snapshot
+    # and store the parameters that *changed* during training. This makes the assumption that it
+    # will be easy in the future to restore the original parameters from the donor models and load
+    # in the delta_state_dicts (which is a feature of GraphModulePlus).
+    model_hashes = {
+        "modelA": {k: _hash_tensor(v) for k, v in donorA.model.state_dict().items()},
+        "modelB": {k: _hash_tensor(v) for k, v in donorB.model.state_dict().items()},
+        "modelAxB": {k: _hash_tensor(v) for k, v in modelAxB.state_dict().items()},
+    }
+
     # Ensure all models are in eval mode and on device
     modelA = donorA.model.eval().to(device)
     modelB = donorB.model.eval().to(device)
@@ -226,6 +251,7 @@ def run_analysis(
     del embedding_getter_A, embedding_getter_B
 
     snapshot_and_test(
+        model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
         "regression",
@@ -245,6 +271,7 @@ def run_analysis(
         device=device,
     )
     snapshot_and_test(
+        model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
         "stitching",
@@ -265,6 +292,7 @@ def run_analysis(
         downstream_name=donorBname,
     )
     snapshot_and_test(
+        model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
         "downstream",
