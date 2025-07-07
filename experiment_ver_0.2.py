@@ -432,21 +432,17 @@ def run_regression_init(
     init_batches: int,
     device: str | torch.device,
 ):
-    reg_input = []
-    reg_output = []
     for i, (im, la) in enumerate(tqdm(train_data, total=init_batches, desc="Regression init")):
         if i >= init_batches:
             break
 
         im = im.to(device)
-        reg_input.append(embedding_getter_A(im))
-        reg_output.append(embedding_getter_B(im))
-
-    # applying init by regression to speed up training time
-    modelAxB.stitching_layer.init_by_regression(
-        from_data=torch.cat(reg_input, dim=0).detach(),
-        to_data=torch.cat(reg_output, dim=0).detach(),
-    )
+        modelAxB.stitching_layer.init_by_regression(
+            embedding_getter_A(im),
+            embedding_getter_B(im),
+            batched=True,
+            final_batch=i == init_batches - 1,
+        )
 
 
 def _flatten_dict(d: dict, key_sep="_") -> dict:
