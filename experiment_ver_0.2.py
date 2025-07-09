@@ -1,39 +1,24 @@
 import dataclasses
 from collections import defaultdict
-from copy import deepcopy
 from enum import Enum, auto
 from pathlib import Path
-from typing import Self, assert_never
+from typing import Self, assert_never, Literal
 
 import mlflow
 import torch
 import torch.fx.graph
 import torch.nn as nn
-
 from graphene.utils.dataloader import DataLoader
 from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase
 from nn_lib.models import get_pretrained_model
 from nn_lib.models.graph_module_plus import GraphModulePlus
 from nn_lib.models.utils import frozen
+from nn_lib.optim import LRFinder
 from nn_lib.utils import save_as_artifact, search_runs_by_params
 from torchmetrics import Accuracy
 from tqdm.auto import tqdm
 
 from stitching import create_stitching_layer
-
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-import io
-
-def display_model_graph(mdl, dpi=200):
-    image = mdl.to_dot().create_png(prog="dot")
-    with io.BytesIO(image) as f:
-        image = mpimg.imread(f)
-    plt.figure(figsize=(image.shape[1] / dpi, image.shape[0] / dpi), dpi=dpi)
-    plt.imshow(image)
-    plt.axis("off")
-    plt.savefig("TempGrap.png")
-    plt.show()
 
 
 def _get_pretrained_model_by_name(model_name: str) -> GraphModulePlus:
@@ -126,16 +111,21 @@ def create_hybrid_model(
     )
 
     image = modelAxB.to_dot().create_png(prog="dot")
-    with open("/tmp/hybrid-model.png", "wb") as f:
+    with open(mlflow.get_artifact_uri("hybrid-model.png"), "wb") as f:
         f.write(image)
-    mlflow.log_artifact("/tmp/hybrid-model.png", "hybrid-model.png")
 
     return modelAxB, donorA_embedding_getter, donorB_embedding_getter
 
 
-def loss_metrics_helper(target_type, modelAxB, modelA, modelB, im, la):
-    """Helper function to compute loss and metrics for the given target type.
-    """
+def loss_metrics_helper(
+    target_type: TargetType,
+    modelAxB: nn.Module,
+    modelA: nn.Module,
+    modelB: nn.Module,
+    im: torch.Tensor,
+    la: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Helper function to compute loss and metrics for the given target type."""
 
     out = modelAxB(im)
     task_acc = (torch.argmax(out, dim=-1) == la).float().mean()
@@ -154,13 +144,28 @@ def loss_metrics_helper(target_type, modelAxB, modelA, modelB, im, la):
     return loss, task_acc, task_ce
 
 
+def _hash_tensor(tensor: torch.Tensor) -> float:
+    """Returns a hash of the tensor, where, by 'hash' we just mean the floating point sum. We move
+    values to CPU to make sure it is deterministic.
+    """
+    return tensor.detach().cpu().numpy().sum() if tensor is not None else 0.0
+
+
 @torch.no_grad()
-def snapshot_and_test(models, val_data, prefix, num_classes, device):
+def snapshot_and_test(hashes, models, val_data, prefix, num_classes, device):
     """Snapshot params and run validation."""
     # Saving all three models so we can run sanity-checks later that only the parameters we
     # wanted to change actually changed in each phase.
     for name, model in models.items():
-        save_as_artifact(model.state_dict(), Path("weights") / f"{prefix}-{name}.pt")
+        # Only record the keys of the state dict that have changed from the donor model. This
+        # is like what we would get if we had used GraphModulePlus.delta_state_dict(), but by doing
+        # it with hashes we save on space. Load these snapshots using
+        # GraphModulePlus.load_delta_state_dict() and the original donor model.
+        sd_hash = hashes[name]
+        delta_state_dict = {
+            k: v for k, v in model.state_dict().items() if _hash_tensor(v) != sd_hash[k]
+        }
+        save_as_artifact(delta_state_dict, Path("weights") / f"{prefix}-{name}.pt")
 
     metrics = {
         "acc1": Accuracy("multiclass", num_classes=num_classes, top_k=1).to(device),
@@ -175,11 +180,15 @@ def snapshot_and_test(models, val_data, prefix, num_classes, device):
             for metric_name, metric_fn in metrics.items():
                 values[f"{prefix}-{model_name}-val-{metric_name}"] += metric_fn(out, la)
 
-            #keeping track of cross entropy to donor models for sanity checking that the data is trending correctly
+            # keeping track of cross entropy to donor models for sanity checking that the data is trending correctly
             teacher_prob = torch.softmax(models["modelA"](im), dim=-1)
-            values[f"{prefix}-{model_name}-sanity-upstream_ce"] += nn.functional.cross_entropy(out, teacher_prob)
+            values[f"{prefix}-{model_name}-sanity-upstream_ce"] += nn.functional.cross_entropy(
+                out, teacher_prob
+            )
             teacher_prob = torch.softmax(models["modelB"](im), dim=-1)
-            values[f"{prefix}-{model_name}-sanity-downstream_ce"] += nn.functional.cross_entropy(out, teacher_prob)
+            values[f"{prefix}-{model_name}-sanity-downstream_ce"] += nn.functional.cross_entropy(
+                out, teacher_prob
+            )
 
     # Average the values over the number of batches and log to mlflow
     values = {k: v.item() / len(val_data) for k, v in values.items()}
@@ -192,28 +201,34 @@ def run_analysis(
     stitch_family: str,
     target_type: TargetType,
     init_batches: int,
-    stitching_lr: float = 1e-3,
+    stitching_lr: float | Literal["auto"] = "auto",
     downstream_lr: float = 1e-5,
     downstream_batches: int = 1000,
     batch_size: int = 200,
     num_workers: int = 4,
     device: torch.device | str = "cuda",
 ):
-    
-    #need to save name later, to fix deepcopy issue
+
+    # need to save name later, to fix deepcopy issue
     donorBname = donorB.model
 
     # Set up models and data if not already initialized
     donorA.maybe_initialize()
     donorB.maybe_initialize()
-    
-    init_modelB = donorB.model
+
     modelAxB, embedding_getter_A, embedding_getter_B = create_hybrid_model(
         donorA, donorB, stitch_family
     )
 
-    after_hubrid_modelB = donorB.model
-    display_model_graph(after_hubrid_modelB)
+    # Get a hash of each parameter of each model so that later we can ensure that we only snapshot
+    # and store the parameters that *changed* during training. This makes the assumption that it
+    # will be easy in the future to restore the original parameters from the donor models and load
+    # in the delta_state_dicts (which is a feature of GraphModulePlus).
+    model_hashes = {
+        "modelA": {k: _hash_tensor(v) for k, v in donorA.model.state_dict().items()},
+        "modelB": {k: _hash_tensor(v) for k, v in donorB.model.state_dict().items()},
+        "modelAxB": {k: _hash_tensor(v) for k, v in modelAxB.state_dict().items()},
+    }
 
     # Ensure all models are in eval mode and on device
     modelA = donorA.model.eval().to(device)
@@ -235,14 +250,16 @@ def run_analysis(
         modelAxB, embedding_getter_A, embedding_getter_B, train_data, init_batches, device
     )
     del embedding_getter_A, embedding_getter_B
-    
+
     snapshot_and_test(
+        model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
         "regression",
         donorB.dataset.num_classes,
         device,
     )
+
     # Phase 1: Train the stitching layer to convergence
     train_stitching_layer_to_convergence(
         modelAxB=modelAxB,
@@ -252,9 +269,10 @@ def run_analysis(
         target_type=target_type,
         lr=stitching_lr,
         max_steps=10000,
-        device=device
+        device=device,
     )
     snapshot_and_test(
+        model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
         "stitching",
@@ -272,9 +290,10 @@ def run_analysis(
         lr=downstream_lr,
         max_steps=downstream_batches,
         device=device,
-        downstream_name=donorBname
+        downstream_name=donorBname,
     )
     snapshot_and_test(
+        model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
         "downstream",
@@ -282,19 +301,6 @@ def run_analysis(
         device,
     )
 
-#A quick and dirty way to make a deepcopy of a module without using deepcopy, as deepcopy is finicky 
-# with c extentions from python
-#TO DO, replace this method with a better one if so desired,
-#TO DO, could not even get this to work, dear lord, pytorch is messy
-def save_n_load(
-        model: GraphModulePlus
-):
-    temp_file = "temp_model.pth"
-    torch.save(model.state_dict(), temp_file)
-    copied_module = torch.fx.GraphModule(nn.Module(), torch.fx.graph())
-    copied_module.load_state_dict(torch.load(temp_file))
-    
-    return GraphModulePlus.new_from_copy(copied_module)
 
 def train_downstream_model(
     modelAxB: GraphModulePlus,
@@ -305,7 +311,7 @@ def train_downstream_model(
     lr: float,
     max_steps: int,
     device: str | torch.device,
-    downstream_name: str
+    downstream_name: str,
 ):
     modelA.eval()
     modelAxB.eval()
@@ -316,35 +322,33 @@ def train_downstream_model(
         new_graph = torch.fx.Graph()
         output_node = new_graph.graph_copy(torch.fx.symbolic_trace(modelB).graph, {})
 
-        #insert in output node, graph_copy does not copy those         
+        # insert in output node, graph_copy does not copy those
         if output_node is not None:
             new_graph.output(output_node)
 
-       
-
-        #create new GraphModulePlus that will be deep copy of modelB to be the teacher for soft label training
+        # create new GraphModulePlus that will be deep copy of modelB to be the teacher for soft label training
         name = None
         class_name = "teacher_" + modelB.__class__.__name__ if name is None else name
-        modelB_teacher = GraphModulePlus(root=modelB, graph=new_graph, class_name = class_name)
+        modelB_teacher = GraphModulePlus(root=modelB, graph=new_graph, class_name=class_name)
 
-        #load state_dict into empty GraphModulePlus for a deep copy
+        # load state_dict into empty GraphModulePlus for a deep copy
         modelB_teacher.load_state_dict(state_copy)
 
-        #apply sanity to check to insure that the copy matches the pretrained model
+        # apply sanity to check to insure that the copy matches the pretrained model
         sanity_check_model = _get_pretrained_model_by_name(downstream_name)
         sanity_check_model.to(device=device)
         modelB_teacher.to(device=device)
 
         teacher_params_before = {k: v.clone() for k, v in modelB_teacher.named_parameters()}
         sanity_params = {k: v.clone() for k, v in sanity_check_model.named_parameters()}
-        
+
         for k, v in sanity_check_model.named_parameters():
             assert torch.allclose(sanity_params[k], teacher_params_before[k])
 
-        #display compututation graph for debugging
-        #display_model_graph(modelB_teacher)
+        # display compututation graph for debugging
+        # display_model_graph(modelB_teacher)
 
-        #currently deep copy does not work, so we will use the entirely new model pulled for MATCH_DOWNSTREAM training
+        # currently deep copy does not work, so we will use the entirely new model pulled for MATCH_DOWNSTREAM training
         modelB_teacher = sanity_check_model
     else:
         modelB_teacher = None
@@ -356,7 +360,6 @@ def train_downstream_model(
                 break
 
             im, la = im.to(device), la.to(device)
-            
 
             loss, task_acc, task_ce = loss_metrics_helper(
                 target_type, modelAxB, modelA, modelB_teacher, im, la
@@ -369,13 +372,14 @@ def train_downstream_model(
             mlflow.log_metric("downstream-modelAxB-train-loss", loss.detach(), step=step)
             mlflow.log_metric("downstream-modelAxB-train-ce", task_ce.detach(), step=step)
             mlflow.log_metric("downstream-modelAxB-train-acc", task_acc.detach(), step=step)
-        
-    #sanity_check that the tensor clone function worked to make a deepcopy
+
+    # sanity_check that the tensor clone function worked to make a deepcopy
     if target_type == TargetType.MATCH_DOWNSTREAM:
         teacher_params_after = {k: v.clone() for k, v in modelB_teacher.named_parameters()}
-        
+
         for k, v in modelB.named_parameters():
             assert torch.allclose(teacher_params_before[k], teacher_params_after[k])
+
 
 def train_stitching_layer_to_convergence(
     modelAxB: GraphModulePlus,
@@ -384,7 +388,7 @@ def train_stitching_layer_to_convergence(
     train_data: DataLoader,
     target_type: TargetType,
     max_steps: int,
-    lr: float,
+    lr: float | Literal["auto"] = "auto",
     lr_time_constant: float = 100.0,
     parameter_convergence_eps: float = 1e-4,
     device: str | torch.device = "cuda",
@@ -392,7 +396,25 @@ def train_stitching_layer_to_convergence(
     modelA.eval()
     modelB.eval()
     modelAxB.stitching_layer.train()
-    optimizer = torch.optim.Adam(modelAxB.parameters(), lr=lr)
+
+    if lr == "auto":
+        optim = torch.optim.Adam(modelAxB.stitching_layer.parameters(), lr=1e-6)
+        lr_finder = LRFinder(
+            modelAxB, optim, criterion=torch.nn.CrossEntropyLoss(), device=device
+        )
+        lr_finder.range_test(
+            train_data,
+            1e-9,
+            1e-1,
+            num_iter=100,
+            callback=lambda itr, lr, loss: mlflow.log_metrics(
+                {"lr-finder-lr": lr, "lr-finder-loss": loss}, step=itr
+            ),
+        )
+        lr = lr_finder.suggestion(stability_check=False)
+
+    mlflow.log_metric("init lr", lr)
+    optimizer = torch.optim.Adam(modelAxB.stitching_layer.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda step: 1 / (1 + step / lr_time_constant)
     )
@@ -457,21 +479,17 @@ def run_regression_init(
     init_batches: int,
     device: str | torch.device,
 ):
-    reg_input = []
-    reg_output = []
     for i, (im, la) in enumerate(tqdm(train_data, total=init_batches, desc="Regression init")):
         if i >= init_batches:
             break
 
         im = im.to(device)
-        reg_input.append(embedding_getter_A(im))
-        reg_output.append(embedding_getter_B(im))
-
-    # applying init by regression to speed up training time
-    modelAxB.stitching_layer.init_by_regression(
-        from_data=torch.cat(reg_input, dim=0).detach(),
-        to_data=torch.cat(reg_output, dim=0).detach(),
-    )
+        modelAxB.stitching_layer.init_by_regression(
+            embedding_getter_A(im),
+            embedding_getter_B(im),
+            batched=True,
+            final_batch=i == init_batches - 1,
+        )
 
 
 def _flatten_dict(d: dict, key_sep="_") -> dict:
@@ -509,7 +527,7 @@ if __name__ == "__main__":
 
     # check if the experiment has already been run
     params = _flatten_dict(args.as_dict())
-   
+
     prior_runs = search_runs_by_params(
         experiment_name=experiment_name,
         finished_only=True,
@@ -520,7 +538,7 @@ if __name__ == "__main__":
         print("Experiment already run with these parameters. Exiting.")
         exit(0)
 
-    #set up run name
+    # set up run name
     match params["target_type"]:
         case TargetType.TASK:
             task_name = "task"
@@ -531,7 +549,23 @@ if __name__ == "__main__":
         case _:
             assert_never(params["target_type"])
 
-    run_name = params["donorA_model"] + "_" + params["donorA_layer"] + "_" + params["donorA_dataset"] + "-X-" + params["donorB_model"] + "_" +  params["donorB_layer"] + "_" + params["donorB_dataset"] + "-" + params["stitch_family"] + "_" + task_name
+    run_name = (
+        params["donorA_model"]
+        + "_"
+        + params["donorA_layer"]
+        + "_"
+        + params["donorA_dataset"]
+        + "-X-"
+        + params["donorB_model"]
+        + "_"
+        + params["donorB_layer"]
+        + "_"
+        + params["donorB_dataset"]
+        + "-"
+        + params["stitch_family"]
+        + "_"
+        + task_name
+    )
 
     with mlflow.start_run(run_name=run_name):
         mlflow.log_params(_flatten_dict(args.as_dict()))
