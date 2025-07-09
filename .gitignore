@@ -182,4 +182,4 @@ debug.txt
 big_df.csv
 
 # IDE files
-.vscode/
+.vscode/*
