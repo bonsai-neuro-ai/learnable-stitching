@@ -212,8 +212,9 @@ def run_analysis(
         donorA, donorB, stitch_family
     )
 
-    after_hubrid_modelB = donorB.model
-    display_model_graph(after_hubrid_modelB)
+    #debugging code
+    #after_hybrid_modelB = donorB.model
+    #display_model_graph(after_hybrid_modelB)
 
     # Ensure all models are in eval mode and on device
     modelA = donorA.model.eval().to(device)
@@ -503,7 +504,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(args)
 
-    experiment_name = "learnable-stitching-v0.2"
+    experiment_name = "learnable-stitching-v0.3-debug"
     mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
     mlflow.set_experiment(experiment_name)
 
