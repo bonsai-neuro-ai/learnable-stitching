@@ -19,7 +19,7 @@ for MODELA in "${MODELS[@]}"; do
     for LAYERA in "${LAYERSA[@]}"; do
       for LAYERB in "${LAYERSB[@]}"; do
         for TARGET in "${TARGETS[@]}"; do
-          CUDA_VISIBLE_DEVICES=0 python3 experiment_ver_0.2.py \
+          CUDA_VISIBLE_DEVICES=0 python3 experiment.py \
             --donorA.model="$MODELA" \
             --donorA.layer="$LAYERA" \
             --donorA.dataset="imagenet" \

@@ -567,6 +567,7 @@ if __name__ == "__main__":
         + task_name
     )
 
+    # set up mlflow to record the run, log parameter experiments, and start the process to generate data for learnable stitching experiment
     with mlflow.start_run(run_name=run_name):
         mlflow.log_params(_flatten_dict(args.as_dict()))
         run_analysis(**parser.instantiate_classes(args).as_dict())
