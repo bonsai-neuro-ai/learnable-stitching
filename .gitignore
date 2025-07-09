@@ -180,3 +180,6 @@ debug.txt
 
 #data files
 big_df.csv
+
+# IDE files
+.vscode
