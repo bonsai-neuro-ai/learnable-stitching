@@ -3,6 +3,7 @@ from collections import defaultdict
 from enum import Enum, auto
 from pathlib import Path
 from typing import Self, assert_never, Literal
+from copy import deepcopy
 
 import mlflow
 import torch
@@ -167,6 +168,7 @@ def snapshot_and_test(hashes, models, val_data, prefix, num_classes, device):
         }
         save_as_artifact(delta_state_dict, Path("weights") / f"{prefix}-{name}.pt")
 
+    # the metrics listed are measured on the validation set of the data
     metrics = {
         "acc1": Accuracy("multiclass", num_classes=num_classes, top_k=1).to(device),
         "acc5": Accuracy("multiclass", num_classes=num_classes, top_k=5).to(device),
@@ -190,7 +192,7 @@ def snapshot_and_test(hashes, models, val_data, prefix, num_classes, device):
                 out, teacher_prob
             )
 
-    # Average the values over the number of batches and log to mlflow
+    # Average the validation metric values over the number of batches and log to mlflow
     values = {k: v.item() / len(val_data) for k, v in values.items()}
     mlflow.log_metrics(values)
 
@@ -209,7 +211,7 @@ def run_analysis(
     device: torch.device | str = "cuda",
 ):
 
-    # need to save name later, to fix deepcopy issue
+    # Save the string name in case we want to do a sanity check with the original model
     donorBname = donorB.model
 
     # Set up models and data if not already initialized
@@ -317,42 +319,29 @@ def train_downstream_model(
     modelAxB.eval()
     modelB.train()
 
+    # If the target labels are from the downstream donor model B, then we need to make a deep copy of B 
+    # Otherwise, because our stitching merges models together, the downstream training will change donor B's weights
+    # Thus changing the target labels and CONFOUNDING THE RESULTS! 
     if target_type == TargetType.MATCH_DOWNSTREAM:
-        state_copy = {k: v.clone() for k, v in modelB.state_dict().items()}
-        new_graph = torch.fx.Graph()
-        output_node = new_graph.graph_copy(torch.fx.symbolic_trace(modelB).graph, {})
-
-        # insert in output node, graph_copy does not copy those
-        if output_node is not None:
-            new_graph.output(output_node)
-
         # create new GraphModulePlus that will be deep copy of modelB to be the teacher for soft label training
-        name = None
-        class_name = "teacher_" + modelB.__class__.__name__ if name is None else name
-        modelB_teacher = GraphModulePlus(root=modelB, graph=new_graph, class_name=class_name)
-
-        # load state_dict into empty GraphModulePlus for a deep copy
-        modelB_teacher.load_state_dict(state_copy)
-
-        # apply sanity to check to insure that the copy matches the pretrained model
-        sanity_check_model = _get_pretrained_model_by_name(downstream_name)
-        sanity_check_model.to(device=device)
-        modelB_teacher.to(device=device)
-
+        modelB_teacher = deepcopy(modelB)
         teacher_params_before = {k: v.clone() for k, v in modelB_teacher.named_parameters()}
-        sanity_params = {k: v.clone() for k, v in sanity_check_model.named_parameters()}
 
-        for k, v in sanity_check_model.named_parameters():
-            assert torch.allclose(sanity_params[k], teacher_params_before[k])
+        # apply sanity to check to insure that the copy matches the pretrained model, if a downstream_name is given
+        if downstream_name is not None:
+            sanity_check_model = _get_pretrained_model_by_name(downstream_name)
+            sanity_check_model.to(device=device)
+            modelB_teacher.to(device=device)
+            sanity_params = {k: v.clone() for k, v in sanity_check_model.named_parameters()}
 
-        # display compututation graph for debugging
-        # display_model_graph(modelB_teacher)
+            for k, v in sanity_check_model.named_parameters():
+                assert torch.allclose(sanity_params[k], teacher_params_before[k])
 
-        # currently deep copy does not work, so we will use the entirely new model pulled for MATCH_DOWNSTREAM training
-        modelB_teacher = sanity_check_model
     else:
         modelB_teacher = None
 
+    # Train the downstream component of the stiched modelAxB by freezing the components from
+    # model A and freezing the stitching layer
     optimizer = torch.optim.Adam(modelB.parameters(), lr=lr)
     with frozen(modelA, modelAxB.stitching_layer):
         for step, (im, la) in enumerate(tqdm(train_data, total=max_steps, desc="Fine-tuning")):
@@ -397,6 +386,7 @@ def train_stitching_layer_to_convergence(
     modelB.eval()
     modelAxB.stitching_layer.train()
 
+    # find the largest learning rate that does not cause the model to jump out of the loss incline
     if lr == "auto":
         optim = torch.optim.Adam(modelAxB.stitching_layer.parameters(), lr=1e-6)
         lr_finder = LRFinder(
@@ -420,12 +410,17 @@ def train_stitching_layer_to_convergence(
     )
     converged = False
 
+    # Train only the stitching layer by keeping all layers from Model A and all layers from Model B frozen
     with frozen(modelA, modelB):
         step = 0
         last_params = {
             k: v.detach().clone() for k, v in modelAxB.stitching_layer.named_parameters()
         }
-        while not converged:
+
+        # The stitching layer must be trained to convergence to prevent the downstream learning 
+        # from *picking up the slack* of the stitching layers unconverged training which would 
+        # CONFOUND THE RESULTS!
+        while not converged: 
             for im, la in train_data:
                 im, la = im.to(device), la.to(device)
 
@@ -521,11 +516,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(args)
 
-    experiment_name = "learnable-stitching-v0.3-debug"
+    experiment_name = "learnable-stitching-v0.3"
     mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
     mlflow.set_experiment(experiment_name)
 
-    # check if the experiment has already been run
+    # check if the experiment parameters have been already been run
     params = _flatten_dict(args.as_dict())
 
     prior_runs = search_runs_by_params(
