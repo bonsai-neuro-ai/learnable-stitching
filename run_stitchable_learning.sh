@@ -29,7 +29,7 @@ for MODELA in "${MODELS[@]}"; do
             --stitch_family="1x1Conv" \
             --target_type="$TARGET" \
             --init_batches=10 \
-            --downstream_batches=500 \
+            --downstream_batches=1000 \
             --batch_size=200 \
             --num_workers=4
           done

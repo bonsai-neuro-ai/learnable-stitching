@@ -579,7 +579,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(args)
 
-    experiment_name = "learnable-stitching-v0.4-debug"
+    experiment_name = "learnable-stitching-v0.4"
     mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
     mlflow.set_experiment(experiment_name)
 
