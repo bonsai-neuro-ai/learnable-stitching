@@ -204,7 +204,7 @@ def run_analysis(
     target_type: TargetType,
     init_batches: int,
     stitching_lr: float | Literal["auto"] = "auto",
-    downstream_lr: float = 1e-5,
+    downstream_lr: float | Literal["auto"] = "auto",
     downstream_batches: int = 1000,
     batch_size: int = 200,
     num_workers: int = 4,
@@ -246,6 +246,10 @@ def run_analysis(
     val_data = donorB.dataset.val_dataloader(
         batch_size=batch_size, num_workers=num_workers, drop_last=True
     )
+
+    #Set number of downstream batches to one epoch
+    if downstream_batches is None:
+        downstream_batches = len(train_data)
 
     # Phase zero: regression-based initialization
     run_regression_init(
@@ -310,10 +314,12 @@ def train_downstream_model(
     modelB: GraphModulePlus,
     train_data: DataLoader,
     target_type: TargetType,
-    lr: float,
     max_steps: int,
     device: str | torch.device,
     downstream_name: str,
+    lr: float | Literal["Auto"] = "Auto",
+    lr_time_constant: float = 100.0,
+    parameter_convergence_eps: float = 1e-4,
 ):
     modelA.eval()
     modelAxB.eval()
@@ -335,39 +341,96 @@ def train_downstream_model(
             sanity_params = {k: v.clone() for k, v in sanity_check_model.named_parameters()}
 
             for k, v in sanity_check_model.named_parameters():
-                assert torch.allclose(sanity_params[k], teacher_params_before[k])
+                assert torch.allclose(sanity_params[k], teacher_params_before[k]), "pretrained model retrieved by name does not have matching parameters with the downstream model when they should be the same model"
 
     else:
         modelB_teacher = None
+
+    # quickly find the relatively best learning rate for the model to begin using
+    if lr == "auto":
+        optim = torch.optim.Adam(modelB.parameters(), lr=1e-6)
+        lr_finder = LRFinder(
+            modelAxB, optim, criterion=torch.nn.CrossEntropyLoss(), device=device
+        )
+        lr_finder.range_test(
+            train_data,
+            1e-9,
+            1e-1,
+            num_iter=100,
+            callback=lambda itr, lr, loss: mlflow.log_metrics(
+                {"downstream-lr-finder-lr": lr, "downstream-lr-finder-loss": loss}, step=itr
+            ),
+        )
+        lr = lr_finder.suggestion(stability_check=False)
+
+    mlflow.log_metric("downstream-init-lr", lr)
+    optimizer = torch.optim.Adam(modelB.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda step: 1 / (1 + step / lr_time_constant)
+    )
+    converged = False
+
 
     # Train the downstream component of the stiched modelAxB by freezing the components from
     # model A and freezing the stitching layer
     optimizer = torch.optim.Adam(modelB.parameters(), lr=lr)
     with frozen(modelA, modelAxB.stitching_layer):
-        for step, (im, la) in enumerate(tqdm(train_data, total=max_steps, desc="Fine-tuning")):
-            if step == max_steps:
-                break
+        step = 0
+        last_params = {
+            k: v.detach().clone() for k, v in modelAxB.named_parameters()
+        }
 
-            im, la = im.to(device), la.to(device)
+        while not converged:
+            for (im, la) in tqdm(train_data, total=max_steps, desc="Fine-tuning"):
 
-            loss, task_acc, task_ce = loss_metrics_helper(
-                target_type, modelAxB, modelA, modelB_teacher, im, la
-            )
+                im, la = im.to(device), la.to(device)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                loss, task_acc, task_ce = loss_metrics_helper(
+                    target_type, modelAxB, modelA, modelB_teacher, im, la
+                )
 
-            mlflow.log_metric("downstream-modelAxB-train-loss", loss.detach(), step=step)
-            mlflow.log_metric("downstream-modelAxB-train-ce", task_ce.detach(), step=step)
-            mlflow.log_metric("downstream-modelAxB-train-acc", task_acc.detach(), step=step)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                new_params = {
+                    k: v.detach().clone() for k, v in modelAxB.named_parameters()
+                }
+                with torch.no_grad():
+                    delta_params = torch.tensor(
+                        [
+                            (new_p - last_p).abs().max()
+                            for new_p, last_p in zip(new_params.values(), last_params.values())
+                        ]
+                    ).max()
+                    last_params = new_params
+
+                if step % 100 == 0:
+                    print(f"Step: {step}\tLoss: {loss.item()}\tDelta params: {delta_params.item()}")
+
+                mlflow.log_metric("downstream-modelAxB-train-loss", loss.detach(), step=step)
+                mlflow.log_metric("downstream-modelAxB-train-ce", task_ce.detach(), step=step)
+                mlflow.log_metric("downstream-modelAxB-train-acc", task_acc.detach(), step=step)
+                mlflow.log_metric("downstream-delta-params", delta_params.detach(), step=step)
+
+                if delta_params < parameter_convergence_eps:
+                    converged = True
+
+                if step >= max_steps:
+                    break
+                
+                step += 1
+
+    mlflow.log_metric("steps to train downstream component", step)
+    mlflow.log_metric("downstream component converged", converged)
 
     # sanity_check that the tensor clone function worked to make a deepcopy
     if target_type == TargetType.MATCH_DOWNSTREAM:
         teacher_params_after = {k: v.clone() for k, v in modelB_teacher.named_parameters()}
 
         for k, v in modelB.named_parameters():
-            assert torch.allclose(teacher_params_before[k], teacher_params_after[k])
+            assert torch.allclose(teacher_params_before[k], teacher_params_after[k]), "The deep copy of the downstream model used as optimization target was unexpectedly changed "
 
 
 def train_stitching_layer_to_convergence(
@@ -398,12 +461,12 @@ def train_stitching_layer_to_convergence(
             1e-1,
             num_iter=100,
             callback=lambda itr, lr, loss: mlflow.log_metrics(
-                {"lr-finder-lr": lr, "lr-finder-loss": loss}, step=itr
+                {"stitching-lr-finder-lr": lr, "stitching-lr-finder-loss": loss}, step=itr
             ),
         )
         lr = lr_finder.suggestion(stability_check=False)
 
-    mlflow.log_metric("init lr", lr)
+    mlflow.log_metric("stitching-init-lr", lr)
     optimizer = torch.optim.Adam(modelAxB.stitching_layer.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda step: 1 / (1 + step / lr_time_constant)
@@ -445,12 +508,6 @@ def train_stitching_layer_to_convergence(
                     ).max()
                     last_params = new_params
 
-                if delta_params < parameter_convergence_eps:
-                    converged = True
-
-                if converged or step >= max_steps:
-                    break
-
                 if step % 100 == 0:
                     print(f"Step: {step}\tLoss: {loss.item()}\tDelta params: {delta_params.item()}")
 
@@ -458,6 +515,12 @@ def train_stitching_layer_to_convergence(
                 mlflow.log_metric("stitching-modelAxB-train-ce", task_ce.detach(), step=step)
                 mlflow.log_metric("stitching-modelAxB-train-acc", task_acc.detach(), step=step)
                 mlflow.log_metric("stitching-delta-params", delta_params.detach(), step=step)
+
+                if delta_params < parameter_convergence_eps:
+                    converged = True
+
+                if converged or step >= max_steps:
+                    break
 
                 step += 1
 
@@ -516,7 +579,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(args)
 
-    experiment_name = "learnable-stitching-v0.3"
+    experiment_name = "learnable-stitching-v0.4-debug"
     mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
     mlflow.set_experiment(experiment_name)
 
