@@ -20,6 +20,8 @@ from torchmetrics import Accuracy
 from tqdm.auto import tqdm
 
 from stitching import create_stitching_layer
+from os import path
+
 
 
 def _get_pretrained_model_by_name(model_name: str) -> GraphModulePlus:
@@ -80,6 +82,11 @@ def create_hybrid_model(
     donorA.maybe_initialize()
     donorB.maybe_initialize()
 
+    image = donorA.model.to_dot().create_png(prog="dot")
+    dir_path = path.dirname(path.realpath(__file__))
+    with open("donorA-computation-map.png", "wb") as f:
+        f.write(image)
+
     # Run dummy data through modelA up to layerA to get its shape
     donorA_embedding_getter = GraphModulePlus.new_from_copy(donorA.model).set_output(donorA.layer)
     dataA_shape = donorA.dataset.shape
@@ -112,6 +119,7 @@ def create_hybrid_model(
     )
 
     image = modelAxB.to_dot().create_png(prog="dot")
+    dir_path = mlflow.get_artifact_uri("hybrid-model.png")
     with open(mlflow.get_artifact_uri("hybrid-model.png"), "wb") as f:
         f.write(image)
 
@@ -274,7 +282,7 @@ def run_analysis(
         train_data=train_data,
         target_type=target_type,
         lr=stitching_lr,
-        max_steps=10000,
+        max_steps=20000,
         device=device,
     )
     snapshot_and_test(
@@ -380,7 +388,7 @@ def train_downstream_model(
             k: v.detach().clone() for k, v in modelAxB.named_parameters()
         }
 
-        while not converged:
+        while not (converged or step >= max_steps):
             for (im, la) in tqdm(train_data, total=max_steps, desc="Fine-tuning"):
 
                 im, la = im.to(device), la.to(device)
@@ -483,7 +491,7 @@ def train_stitching_layer_to_convergence(
         # The stitching layer must be trained to convergence to prevent the downstream learning 
         # from *picking up the slack* of the stitching layers unconverged training which would 
         # CONFOUND THE RESULTS!
-        while not converged: 
+        while not (converged or step >= max_steps): 
             for im, la in train_data:
                 im, la = im.to(device), la.to(device)
 
