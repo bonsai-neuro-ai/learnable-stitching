@@ -2,19 +2,35 @@
     // Use IntelliSense to learn about possible attributes.
     // Hover to view descriptions of existing attributes.
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
+    "version": "0.4.0",
     "configurations": [
+        
         {
-            "name": "debug experiment ver 0.2",
+            "name": "debug experiment ver 0.4",
             "type": "debugpy",
             "request": "launch",
-            "program": "experiment_ver_0.2.py",
+            "program": "experiment.py",
             "console": "integratedTerminal",
             "python": ".venv/bin/python",
-            "args": ["--stitch_family", "1x1Conv", "--target_type", "${command:pickArgs}", "--init_batches", "5", "--batch_size", "1", 
-                     "--donorA.model", "resnet18", "--donorA.layer", "add_5", "--donorA.dataset", "imagenet",
-                     "--donorB.model", "resnet34", "--donorB.layer", "add_6", "--donorB.dataset", "imagenet",
-                     "--downstream_batches", "10", ]
+            "args": ["--stitch_family", "1x1Conv", "--target_type", "${command:pickArgs}", "--init_batches", "10", "--batch_size", "200", 
+                     "--donorA.model", "resnet18", "--donorA.layer", "add_2", "--donorA.dataset", "imagenet",
+                     "--donorB.model", "resnet34", "--donorB.layer", "add_15", "--donorB.dataset", "imagenet",
+                    ],
+           "justMyCode": false
+        },
+
+        {
+            "name": "debug experiment mscoco",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "experiment.py",
+            "console": "integratedTerminal",
+            "python": ".venv/bin/python",
+            "args": ["--stitch_family", "1x1Conv", "--target_type", "${command:pickArgs}", "--init_batches", "10", "--batch_size", "200", 
+                     "--donorA.model", "fcn_resnet50", "--donorA.layer", "add_2", "--donorA.dataset", "imagenet",
+                     "--donorB.model", "resnet18", "--donorB.layer", "add_4", "--donorB.dataset", "imagenet",
+                    ],
+           "justMyCode": false
         }
     ]
 }
