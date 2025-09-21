@@ -86,6 +86,7 @@ plt.ylabel("Upstream model")
 plt.xticks(rotation=90)
 plt.tight_layout()
 plt.show()
+#plt.savefig(f"analysis/plots/stitching_modelAxB_val_loss.svg")
 
 plt.figure(figsize=(10, 10))
 pivot_heatmap(
@@ -102,46 +103,48 @@ plt.ylabel("Upstream model")
 plt.xticks(rotation=90)
 plt.tight_layout()
 plt.show()
+#plt.savefig(f"analysis/plots/downstream_modelAxB_val_loss.svg")
 
 # %% Plotting by model
 
-# for (modelA, modelB), group in groups:
-#     fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-#
-#     print(f"Plotting heatmaps for {modelA} x {modelB}")
-#     pivot_heatmap(
-#         group,
-#         metric="metrics.stitching-modelAxB-val-loss",
-#         row_col="params.donorA_layer",
-#         col_col="params.donorB_layer",
-#         vmin=0,
-#         vmax=10,
-#         ax=ax[0],
-#         sort_key=layer_idx,
-#     )
-#     ax[0].set_xlabel(modelB)
-#     ax[0].set_ylabel(modelA)
-#     ax[0].set_title("Stitching loss")
-#
-#     pivot_heatmap(
-#         group,
-#         metric="metrics.downstream-modelAxB-val-loss",
-#         row_col="params.donorA_layer",
-#         col_col="params.donorB_layer",
-#         vmin=0,
-#         vmax=10,
-#         ax=ax[1],
-#         sort_key=layer_idx,
-#     )
-#     ax[1].set_xlabel(modelB)
-#     ax[1].set_ylabel(modelA)
-#     ax[1].set_title("Fine-tuning loss")
-#     fig.tight_layout()
-#     plt.show()
+for (modelA, modelB), group in groups:
+     fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+
+     print(f"Plotting heatmaps for {modelA} x {modelB}")
+     pivot_heatmap(
+         group,
+         metric="metrics.stitching-modelAxB-val-loss",
+         row_col="params.donorA_layer",
+         col_col="params.donorB_layer",
+         vmin=0,
+         vmax=10,
+         ax=ax[0],
+         sort_key=layer_idx,
+     )
+     ax[0].set_xlabel(modelB)
+     ax[0].set_ylabel(modelA)
+     ax[0].set_title("Stitching loss")
+     #plt.savefig(f"analysis/plots/stitching_{modelA}x{modelB}_val_loss.svg")
+
+
+     pivot_heatmap(
+         group,
+         metric="metrics.downstream-modelAxB-val-loss",
+         row_col="params.donorA_layer",
+         col_col="params.donorB_layer",
+         vmin=0,
+         vmax=10,
+         ax=ax[1],
+         sort_key=layer_idx,
+     )
+     ax[1].set_xlabel(modelB)
+     ax[1].set_ylabel(modelA)
+     ax[1].set_title("Fine-tuning loss")
+     fig.tight_layout()
+     plt.show()
+     plt.savefig(f"analysis/plots/{modelA}x{modelB}_val_loss.svg")
 
 # %% Plots for loss curves
-
-
 def color_for_model_layer(shortname):
     model, layer = shortname.split("_")
     color_group = cm["tab20"].colors
@@ -176,9 +179,9 @@ def plot_loss_sequence(run_id, *, color=None, label=None, bin_steps=10, ax=None)
     # Often finetuning accomplishes a lot in the first few steps, which is hidden by the binning
     # done by 'bin_steps'. To *visually* fix this, prepend a copy of the last stitching row with
     # step=0, since performance at end of stitching is the starting point for finetuning.
-    copy_of_last_stitching_row = hist_stitch.iloc[-1].to_dict()
-    copy_of_last_stitching_row["step"] = 0
-    hist_finetune = pd.concat([pd.DataFrame([copy_of_last_stitching_row]), hist_finetune])
+    #copy_of_last_stitching_row = hist_stitch.iloc[-1].to_dict()
+    #copy_of_last_stitching_row["step"] = 0
+    #hist_finetune = pd.concat([pd.DataFrame([copy_of_last_stitching_row]), hist_finetune])
 
     ax.plot(
         hist_stitch["neg_step"],
@@ -228,12 +231,19 @@ for key, grp in df.groupby("downstream"):
     loss1_on_2 = winner1[metric2]  # Performance of best-stitching layer after finetuning
     loss2_on_1 = winner2[metric1]  # Performance of best-finetuning layer after stitching
 
+    #check convergance
+    converged = False
+    if winner1["metrics.stitching layer converged"] and winner2["metrics.stitching layer converged"]:
+        converged = True
+        print(f"{key} -- both models have converged stitching layers -- {winner1["metrics.stitching layer converged"]}, {winner2["metrics.stitching layer converged"]}")
+
     is_rank_order_violation = winner1["upstream"] != winner2["upstream"]
     is_sane = loss1_on_2 < loss1_on_1 and loss2_on_2 < loss2_on_1
     print(
         key,
         is_rank_order_violation,
         is_sane,
+        converged,
         winner1["upstream"],
         winner2["upstream"],
         loss1_on_1,
@@ -243,7 +253,8 @@ for key, grp in df.groupby("downstream"):
         sep="\t",
     )
 
-    if is_rank_order_violation:
+    if is_rank_order_violation and converged:
+        print("inside condition")
         plt.figure(figsize=(4, 3))
         plot_loss_sequence(
             winner1["run_id"],
@@ -264,5 +275,6 @@ for key, grp in df.groupby("downstream"):
         plt.legend()
         plt.title(f"Rank-order violation on downstream {key}")
         plt.tight_layout()
-        plt.savefig(f"analysis/plots/rank_order_violation_loss_curves_{key}.svg")
         plt.show()
+
+        plt.savefig(f"analysis/plots/rank_order_violation_loss_curves_{key}.svg")
