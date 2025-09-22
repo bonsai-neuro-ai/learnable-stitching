@@ -194,9 +194,6 @@ def plot_loss_sequence(run_id, *, color=None, label=None, bin_steps=10, ax=None)
 
 
 for downstream, group in df.groupby("downstream"):
-    if downstream != "r50_06":
-        continue
-
     plt.figure()
     for _, row in group.iterrows():
         upstream = row["upstream"]
@@ -212,6 +209,7 @@ for downstream, group in df.groupby("downstream"):
     plt.xlabel("Step")
     plt.ylabel("Loss")
     plt.legend(title="Upstream")
+    plt.title(downstream)
     plt.savefig(f"analysis/plots/stitch_compat_loss_curves_{downstream}.svg")
     plt.show()
 
