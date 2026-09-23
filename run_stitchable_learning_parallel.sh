@@ -39,11 +39,12 @@ for MODELA in "${MODELS[@]}"; do
             --donorB.layer="$LAYERB" \
             --donorB.dataset="imagenet" \
             --stitch_family="1x1Conv" \
+            --stitch_init="skipAll" \
             --target_type="$target_task" \
             --init_batches=10 \
             --downstream_batches=1000 \
             --batch_size=200 \
-            --num_workers=4
+            --num_workers=4 
         done
       done
   done

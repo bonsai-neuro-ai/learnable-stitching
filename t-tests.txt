@@ -1,0 +1,36 @@
+
+Independent T-Test Results r.o.v. in loss Between resnet50_add_5_imagenet and resnet34_add_7_imagenet on downstreamresnet18-add_3-imagenet
+resnet50_add_5_imagenet loss > resnet34_add_7_imagenet loss
+t-stat: 3.698158854762306  p-value: 0.00010881134320444322
+resnet50_add_5_imagenet loss < resnet34_add_7_imagenet loss
+t-stat: -3.692182933614804  p-value: 0.000111399522599026
+
+Independent T-Test Results r.o.v. in loss Between resnet50_add_9_imagenet and resnet50_add_10_imagenet on downstreamresnet34-add_9-imagenet
+resnet50_add_9_imagenet loss > resnet50_add_10_imagenet loss
+t-stat: 4.799911003065142  p-value: 7.981634216587482e-07
+resnet50_add_9_imagenet loss < resnet50_add_10_imagenet loss
+t-stat: -4.585918437155588  p-value: 2.270708351969595e-06
+
+Independent T-Test Results r.o.v. in loss Between resnet50_add_10_imagenet and resnet50_add_11_imagenet on downstreamresnet34-add_10-imagenet
+resnet50_add_10_imagenet loss > resnet50_add_11_imagenet loss
+t-stat: 3.1146441111522125  p-value: 0.0009218510482464983
+resnet50_add_10_imagenet loss < resnet50_add_11_imagenet loss
+t-stat: -6.020566700325784  p-value: 8.809264880997847e-10
+
+Independent T-Test Results r.o.v. in loss Between resnet50_add_10_imagenet and resnet50_add_12_imagenet on downstreamresnet34-add_11-imagenet
+resnet50_add_10_imagenet loss > resnet50_add_12_imagenet loss
+t-stat: 7.998053690105991  p-value: 6.586161405642333e-16
+resnet50_add_10_imagenet loss < resnet50_add_12_imagenet loss
+t-stat: -3.708435612593086  p-value: 0.00010449204865035267
+
+Independent T-Test Results r.o.v. in loss Between resnet34_add_3_imagenet and resnet34_add_5_imagenet on downstreamresnet50-add_4-imagenet
+resnet34_add_3_imagenet loss > resnet34_add_5_imagenet loss
+t-stat: 15.705144209690213  p-value: 1.2658502291116296e-55
+resnet34_add_3_imagenet loss < resnet34_add_5_imagenet loss
+t-stat: -3.2034212584936603  p-value: 0.0006798567029271585
+
+Independent T-Test Results r.o.v. in loss Between resnet34_add_9_imagenet and resnet34_add_11_imagenet on downstreamresnet50-add_11-imagenet
+resnet34_add_9_imagenet loss > resnet34_add_11_imagenet loss
+t-stat: 8.967376571245756  p-value: 1.6196358306406179e-19
+resnet34_add_9_imagenet loss < resnet34_add_11_imagenet loss
+t-stat: -3.5807122070812074  p-value: 0.00017164700761637943

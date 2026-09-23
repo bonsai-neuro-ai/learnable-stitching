@@ -84,7 +84,7 @@ def penalize_non_rotations(weights: torch.Tensor):
     """Regularizer to softly encourage weights to be rotation-like"""
     # if weights.ndim != 2:
     #     raise ValueError("weights must be a 2D tensor")
-    # wtw = weights.T @ weights
+    # wtw = weights.T @ weightsstiti
     # identity = torch.eye(wtw.shape[0], device=weights.device)
     # return torch.sum((wtw - identity) ** 2)
     return -torch.linalg.slogdet(weights)[1]

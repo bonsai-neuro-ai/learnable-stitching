@@ -27,8 +27,8 @@
             "console": "integratedTerminal",
             "python": ".venv/bin/python",
             "args": ["--stitch_family", "1x1Conv", "--target_type", "${command:pickArgs}", "--init_batches", "10", "--batch_size", "200", 
-                     "--donorA.model", "fcn_resnet50", "--donorA.layer", "add_2", "--donorA.dataset", "imagenet",
-                     "--donorB.model", "resnet18", "--donorB.layer", "add_4", "--donorB.dataset", "imagenet",
+                     "--donorA.model", "resnet18", "--donorA.layer", "add_5", "--donorA.dataset", "imagenet",
+                     "--donorB.model", "resnet50", "--donorB.layer", "add_14", "--donorB.dataset", "imagenet",
                     ],
            "justMyCode": false
         }

@@ -2,7 +2,7 @@ from typing import Self
 
 import nn_lib.models.fancy_layers as fl
 import torch
-from nn_lib.models.utils import conv2d_shape_inverse
+from nn_lib.utils.models import conv2d_shape_inverse
 from torch import nn
 
 
