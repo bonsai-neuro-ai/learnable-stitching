@@ -1,9 +1,9 @@
 import dataclasses
 from collections import defaultdict
+from copy import deepcopy
 from enum import Enum, auto
 from pathlib import Path
 from typing import Self, assert_never, Literal
-from copy import deepcopy
 
 import mlflow
 import torch
@@ -13,15 +13,13 @@ from graphene.utils.dataloader import DataLoader
 from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase
 from nn_lib.models import get_pretrained_model
 from nn_lib.models.graph_module_plus import GraphModulePlus
-from nn_lib.utils.models import frozen
 from nn_lib.optim import LRFinder
 from nn_lib.utils import save_as_artifact, search_runs_by_params
+from nn_lib.utils.models import frozen
 from torchmetrics import Accuracy
 from tqdm.auto import tqdm
 
 from stitching import create_stitching_layer
-from os import path
-
 
 
 def _get_pretrained_model_by_name(model_name: str) -> GraphModulePlus:
@@ -64,7 +62,7 @@ class DonorSpec:
 
 
 def create_hybrid_model(
-    donorA: DonorSpec, donorB: DonorSpec, stitch_family: str
+    donorA: DonorSpec, donorB: DonorSpec, stitch_family: str, plot_architecture: bool = False
 ) -> tuple[GraphModulePlus, GraphModulePlus, GraphModulePlus]:
     """Initializes a stitched model, inferring the shapes of the layers to be stitched.
 
@@ -81,11 +79,6 @@ def create_hybrid_model(
     # Set up models and data if not already initialized
     donorA.maybe_initialize()
     donorB.maybe_initialize()
-
-    image = donorA.model.to_dot().create_png(prog="dot")
-    dir_path = path.dirname(path.realpath(__file__))
-    with open("donorA-computation-map.png", "wb") as f:
-        f.write(image)
 
     # Run dummy data through modelA up to layerA to get its shape
     donorA_embedding_getter = GraphModulePlus.new_from_copy(donorA.model).set_output(donorA.layer)
@@ -118,10 +111,14 @@ def create_hybrid_model(
         auto_trace=False,
     )
 
-    image = modelAxB.to_dot().create_png(prog="dot")
-    dir_path = mlflow.get_artifact_uri("hybrid-model.png")
-    with open(mlflow.get_artifact_uri("hybrid-model.png"), "wb") as f:
-        f.write(image)
+    if plot_architecture:
+        image = donorA.model.to_dot().create_png(prog="dot")
+        with open("donorA-computation-map.png", "wb") as f:
+            f.write(image)
+
+        image = modelAxB.to_dot().create_png(prog="dot")
+        with open(mlflow.get_artifact_uri("hybrid-model.png"), "wb") as f:
+            f.write(image)
 
     return modelAxB, donorA_embedding_getter, donorB_embedding_getter
 
@@ -209,7 +206,7 @@ def run_analysis(
     donorA: DonorSpec,
     donorB: DonorSpec,
     stitch_family: str,
-    stitch_init: str, 
+    stitch_init: str,
     target_type: TargetType,
     init_batches: int,
     stitching_lr: float | Literal["auto"] = "auto",
@@ -256,7 +253,7 @@ def run_analysis(
         batch_size=batch_size, num_workers=num_workers, drop_last=True
     )
 
-    #Set number of downstream batches to one epoch
+    # Set number of downstream batches to one epoch
     if downstream_batches is None:
         downstream_batches = len(train_data)
 
@@ -278,16 +275,16 @@ def run_analysis(
 
     # Phase 1: Train the stitching layer to convergence
     if stitch_init != "skip1" or stitch_init != "skipAll":
-            train_stitching_layer_to_convergence(
-                modelAxB=modelAxB,
-                modelA=modelA,
-                modelB=modelB,
-                train_data=train_data,
-                target_type=target_type,
-                lr=stitching_lr,
-                max_steps=20000,
-                device=device,
-            )
+        train_stitching_layer_to_convergence(
+            modelAxB=modelAxB,
+            modelA=modelA,
+            modelB=modelB,
+            train_data=train_data,
+            target_type=target_type,
+            lr=stitching_lr,
+            max_steps=20000,
+            device=device,
+        )
     snapshot_and_test(
         model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
@@ -336,9 +333,9 @@ def train_downstream_model(
     modelAxB.eval()
     modelB.train()
 
-    # If the target labels are from the downstream donor model B, then we need to make a deep copy of B 
+    # If the target labels are from the downstream donor model B, then we need to make a deep copy of B
     # Otherwise, because our stitching merges models together, the downstream training will change donor B's weights
-    # Thus changing the target labels and CONFOUNDING THE RESULTS! 
+    # Thus changing the target labels and CONFOUNDING THE RESULTS!
     if target_type == TargetType.MATCH_DOWNSTREAM:
         # create new GraphModulePlus that will be deep copy of modelB to be the teacher for soft label training
         modelB_teacher = deepcopy(modelB)
@@ -352,7 +349,9 @@ def train_downstream_model(
             sanity_params = {k: v.clone() for k, v in sanity_check_model.named_parameters()}
 
             for k, v in sanity_check_model.named_parameters():
-                assert torch.allclose(sanity_params[k], teacher_params_before[k]), "pretrained model retrieved by name does not have matching parameters with the downstream model when they should be the same model"
+                assert torch.allclose(
+                    sanity_params[k], teacher_params_before[k]
+                ), "pretrained model retrieved by name does not have matching parameters with the downstream model when they should be the same model"
 
     else:
         modelB_teacher = None
@@ -360,9 +359,7 @@ def train_downstream_model(
     # quickly find the relatively best learning rate for the model to begin using
     if lr == "auto":
         optim = torch.optim.Adam(modelB.parameters(), lr=1e-6)
-        lr_finder = LRFinder(
-            modelAxB, optim, criterion=torch.nn.CrossEntropyLoss(), device=device
-        )
+        lr_finder = LRFinder(modelAxB, optim, criterion=torch.nn.CrossEntropyLoss(), device=device)
         lr_finder.range_test(
             train_data,
             1e-9,
@@ -381,18 +378,15 @@ def train_downstream_model(
     )
     converged = False
 
-
     # Train the downstream component of the stiched modelAxB by freezing the components from
     # model A and freezing the stitching layer
     optimizer = torch.optim.Adam(modelB.parameters(), lr=lr)
     with frozen(modelA, modelAxB.stitching_layer):
         step = 0
-        last_params = {
-            k: v.detach().clone() for k, v in modelAxB.named_parameters()
-        }
+        last_params = {k: v.detach().clone() for k, v in modelAxB.named_parameters()}
 
         while not (converged or step >= max_steps):
-            for (im, la) in tqdm(train_data, total=max_steps, desc="Fine-tuning"):
+            for im, la in tqdm(train_data, total=max_steps, desc="Fine-tuning"):
 
                 im, la = im.to(device), la.to(device)
 
@@ -405,9 +399,7 @@ def train_downstream_model(
                 optimizer.step()
                 scheduler.step()
 
-                new_params = {
-                    k: v.detach().clone() for k, v in modelAxB.named_parameters()
-                }
+                new_params = {k: v.detach().clone() for k, v in modelAxB.named_parameters()}
                 with torch.no_grad():
                     delta_params = torch.tensor(
                         [
@@ -431,7 +423,7 @@ def train_downstream_model(
                 if step >= max_steps:
 
                     break
-                
+
                 step += 1
 
     mlflow.log_metric("steps to train downstream component", step)
@@ -442,7 +434,9 @@ def train_downstream_model(
         teacher_params_after = {k: v.clone() for k, v in modelB_teacher.named_parameters()}
 
         for k, v in modelB.named_parameters():
-            assert torch.allclose(teacher_params_before[k], teacher_params_after[k]), "The deep copy of the downstream model used as optimization target was unexpectedly changed "
+            assert torch.allclose(
+                teacher_params_before[k], teacher_params_after[k]
+            ), "The deep copy of the downstream model used as optimization target was unexpectedly changed "
 
 
 def train_stitching_layer_to_convergence(
@@ -464,9 +458,7 @@ def train_stitching_layer_to_convergence(
     # find the largest learning rate that does not cause the model to jump out of the loss incline
     if lr == "auto":
         optim = torch.optim.Adam(modelAxB.stitching_layer.parameters(), lr=1e-6)
-        lr_finder = LRFinder(
-            modelAxB, optim, criterion=torch.nn.CrossEntropyLoss(), device=device
-        )
+        lr_finder = LRFinder(modelAxB, optim, criterion=torch.nn.CrossEntropyLoss(), device=device)
         lr_finder.range_test(
             train_data,
             1e-9,
@@ -492,10 +484,10 @@ def train_stitching_layer_to_convergence(
             k: v.detach().clone() for k, v in modelAxB.stitching_layer.named_parameters()
         }
 
-        # The stitching layer must be trained to convergence to prevent the downstream learning 
-        # from *picking up the slack* of the stitching layers unconverged training which would 
+        # The stitching layer must be trained to convergence to prevent the downstream learning
+        # from *picking up the slack* of the stitching layers unconverged training which would
         # CONFOUND THE RESULTS!
-        while not (converged or step >= max_steps): 
+        while not (converged or step >= max_steps):
             for im, la in train_data:
                 im, la = im.to(device), la.to(device)
 
@@ -597,8 +589,7 @@ if __name__ == "__main__":
 
     # check if the experiment parameters have been already been run
     params = _flatten_dict(args.as_dict())
-    
-    
+
     prior_runs = search_runs_by_params(
         experiment_name=experiment_name,
         finished_only=True,
@@ -608,7 +599,7 @@ if __name__ == "__main__":
     if not prior_runs.empty:
         print("Experiment already run with these parameters. Exiting.")
         exit(0)
-    
+
     # set up run name
     match params["target_type"]:
         case TargetType.TASK:
