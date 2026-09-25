@@ -28,15 +28,17 @@ import pandas as pd
 
 #Knob #1
 #independent variable is the dataset
-imagenet = ImageNetDataModule(root_dir="/data/datasets", batch_size = 100, num_workers = 10)
-coco_seg = CocoDetectionDataModule(root_dir="/data/datasets", batch_size = 100, num_workers = 10)
+imagenet = ImageNetDataModule(root_dir="/data/datasets")
+coco_seg = CocoDetectionDataModule(root_dir="/data/datasets")
 datalist = {"imagenet": imagenet, "coco": coco_seg}
 
 #Knob #1.5
 #The selection of the stitching parents from the pretrained models for the given dataset
 imagenet_models = {"resnet50": get_pretrained_model("resnet18"), "resnet101": get_pretrained_model("resnet34"), "ViT": get_pretrained_model("vit_b_32")}
-coco_models = {}
+coco_models = {"cocor50": get_pretrained_model("FCN_ResNet50")}
 modellist = {"imagenet": imagenet_models, "coco": coco_models}
+
+
 
 #Knob 2
 #The selection of the stitching layer
@@ -64,8 +66,9 @@ data_module.prepare_data()
 
 
 #Get pretrained models that will be stitched together
-modelA = modellist["imagenet"]["resnet50"]
-modelB = modellist["imagenet"]["resnet101"]
+
+modelA = modellist["coco"]["cocor50"]
+modelB = modellist["imagenet"]["resnet50"]
 
 #Get the graph trace of our pretrained models 
 traceA = symbolic_trace(modelA)
@@ -115,7 +118,7 @@ def quick_run_and_check(model, images, labels, name):
         output = model(images)
     print(f"{name}: {torch.sum(torch.argmax(output, dim=1) == labels).item()} / {len(labels)}")
 
-#display_model_graph(modelA, "temp.png")
+display_model_graph(modelA, "temp.png")
 
 
 data_module.setup("test")
@@ -131,8 +134,6 @@ data_loader = data_module.train_dataloader()
 
 for layerA in layersA:
     for layerB in layersB:
-        
-
         #use dummy inputs to extract input and out put shape for desired layers
 
         modelA_ = modelA.extract_subgraph(inputs = ["x"], output=layerA)

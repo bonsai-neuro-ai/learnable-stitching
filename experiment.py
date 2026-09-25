@@ -13,7 +13,7 @@ from graphene.utils.dataloader import DataLoader
 from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase
 from nn_lib.models import get_pretrained_model
 from nn_lib.models.graph_module_plus import GraphModulePlus
-from nn_lib.models.utils import frozen
+from nn_lib.utils.models import frozen
 from nn_lib.optim import LRFinder
 from nn_lib.utils import save_as_artifact, search_runs_by_params
 from torchmetrics import Accuracy
@@ -209,6 +209,7 @@ def run_analysis(
     donorA: DonorSpec,
     donorB: DonorSpec,
     stitch_family: str,
+    stitch_init: str, 
     target_type: TargetType,
     init_batches: int,
     stitching_lr: float | Literal["auto"] = "auto",
@@ -260,10 +261,11 @@ def run_analysis(
         downstream_batches = len(train_data)
 
     # Phase zero: regression-based initialization
-    run_regression_init(
-        modelAxB, embedding_getter_A, embedding_getter_B, train_data, init_batches, device
-    )
-    del embedding_getter_A, embedding_getter_B
+    if stitch_init != "skip0" or stitch_init != "skipAll":
+        run_regression_init(
+            modelAxB, embedding_getter_A, embedding_getter_B, train_data, init_batches, device
+        )
+        del embedding_getter_A, embedding_getter_B
 
     snapshot_and_test(
         model_hashes,
@@ -275,16 +277,17 @@ def run_analysis(
     )
 
     # Phase 1: Train the stitching layer to convergence
-    train_stitching_layer_to_convergence(
-        modelAxB=modelAxB,
-        modelA=modelA,
-        modelB=modelB,
-        train_data=train_data,
-        target_type=target_type,
-        lr=stitching_lr,
-        max_steps=20000,
-        device=device,
-    )
+    if stitch_init != "skip1" or stitch_init != "skipAll":
+            train_stitching_layer_to_convergence(
+                modelAxB=modelAxB,
+                modelA=modelA,
+                modelB=modelB,
+                train_data=train_data,
+                target_type=target_type,
+                lr=stitching_lr,
+                max_steps=20000,
+                device=device,
+            )
     snapshot_and_test(
         model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
@@ -426,6 +429,7 @@ def train_downstream_model(
                     converged = True
 
                 if step >= max_steps:
+
                     break
                 
                 step += 1
@@ -593,17 +597,18 @@ if __name__ == "__main__":
 
     # check if the experiment parameters have been already been run
     params = _flatten_dict(args.as_dict())
-
+    
+    
     prior_runs = search_runs_by_params(
         experiment_name=experiment_name,
         finished_only=True,
         params=params,
-        ignore={"device": ..., "num_workers": ...},
+        skip_keys={"device": ..., "num_workers": ...},
     )
     if not prior_runs.empty:
         print("Experiment already run with these parameters. Exiting.")
         exit(0)
-
+    
     # set up run name
     match params["target_type"]:
         case TargetType.TASK:
@@ -631,6 +636,8 @@ if __name__ == "__main__":
         + params["stitch_family"]
         + "_"
         + task_name
+        + "_"
+        + params["stitch_init"]
     )
 
     # set up mlflow to record the run, log parameter experiments, and start the process to generate data for learnable stitching experiment
