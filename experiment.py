@@ -15,6 +15,7 @@ from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase
 from nn_lib.models import get_pretrained_model
 from nn_lib.models.graph_module_plus import GraphModulePlus
 from nn_lib.optim import LRFinder
+from nn_lib.optim.lr_finder import UnstableLREstimate
 from nn_lib.utils import RunIndex, logged_run, save_as_artifact
 from nn_lib.utils.models import frozen
 from torch import nn
@@ -271,9 +272,13 @@ def training_helper(
                 synchronous=False,
             ),
         )
-        init_lr = min(
-            config.largest_reasonable_lr, max(config.smallest_reasonable_lr, lr_finder.suggestion())
-        )
+        try:
+            init_lr = min(
+                config.largest_reasonable_lr,
+                max(config.smallest_reasonable_lr, lr_finder.suggestion()),
+            )
+        except UnstableLREstimate:
+            init_lr = config.smallest_reasonable_lr
     else:
         init_lr = config.lr
 
