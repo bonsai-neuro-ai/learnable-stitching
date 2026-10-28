@@ -1,21 +1,23 @@
 import dataclasses
+import itertools
+import sys
 from collections import defaultdict
-from copy import deepcopy
+from collections.abc import Iterable
 from enum import Enum, auto
 from pathlib import Path
-from typing import Self, assert_never, Literal
+from typing import Literal, Self, assert_never
 
 import mlflow
 import torch
 import torch.fx.graph
-import torch.nn as nn
 from graphene.utils.dataloader import DataLoader
 from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase
 from nn_lib.models import get_pretrained_model
 from nn_lib.models.graph_module_plus import GraphModulePlus
 from nn_lib.optim import LRFinder
-from nn_lib.utils import save_as_artifact, search_runs_by_params
+from nn_lib.utils import RunIndex, logged_run, save_as_artifact
 from nn_lib.utils.models import frozen
+from torch import nn
 from torchmetrics import Accuracy
 from tqdm.auto import tqdm
 
@@ -38,7 +40,7 @@ def _get_dataset_by_name(dataset_name: str) -> TorchvisionDataModuleBase:
             dm.prepare_data()
             return dm
         case _:
-            assert_never(dataset_name)
+            raise ValueError(f"Unknown dataset {dataset_name}")
 
 
 class TargetType(Enum):
@@ -130,21 +132,22 @@ def loss_metrics_helper(
     modelB: nn.Module,
     im: torch.Tensor,
     la: torch.Tensor,
+    outAxB: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Helper function to compute loss and metrics for the given target type."""
-
-    out = modelAxB(im)
-    task_acc = (torch.argmax(out, dim=-1) == la).float().mean()
-    task_ce = nn.functional.cross_entropy(out, la)
+    if outAxB is None:
+        outAxB = modelAxB(im)
+    task_acc = (torch.argmax(outAxB, dim=-1) == la).float().mean()
+    task_ce = nn.functional.cross_entropy(outAxB, la)
     match target_type:
         case TargetType.TASK:
             loss = task_ce
         case TargetType.MATCH_UPSTREAM:
             teacher_prob = torch.softmax(modelA(im), dim=-1)
-            loss = nn.functional.cross_entropy(out, teacher_prob)
+            loss = nn.functional.cross_entropy(outAxB, teacher_prob)
         case TargetType.MATCH_DOWNSTREAM:
             teacher_prob = torch.softmax(modelB(im), dim=-1)
-            loss = nn.functional.cross_entropy(out, teacher_prob)
+            loss = nn.functional.cross_entropy(outAxB, teacher_prob)
         case _:
             assert_never(target_type)
     return loss, task_acc, task_ce
@@ -175,13 +178,17 @@ def snapshot_and_test(hashes, models, val_data, prefix, num_classes, device):
 
     # the metrics listed are measured on the validation set of the data
     metrics = {
-        "acc1": Accuracy("multiclass", num_classes=num_classes, top_k=1).to(device),
-        "acc5": Accuracy("multiclass", num_classes=num_classes, top_k=5).to(device),
+        "acc1": Accuracy("multiclass", num_classes=num_classes, top_k=1).to(
+            device, non_blocking=True
+        ),
+        "acc5": Accuracy("multiclass", num_classes=num_classes, top_k=5).to(
+            device, non_blocking=True
+        ),
         "loss": nn.functional.cross_entropy,
     }
     values = defaultdict(lambda: torch.zeros(1, device=device))
     for im, la in tqdm(val_data, desc=f"Validating[{prefix}]", total=len(val_data)):
-        im, la = im.to(device), la.to(device)
+        im, la = im.to(device, non_blocking=True), la.to(device, non_blocking=True)
         for model_name, model in models.items():
             out = model(im)
             for metric_name, metric_fn in metrics.items():
@@ -199,27 +206,195 @@ def snapshot_and_test(hashes, models, val_data, prefix, num_classes, device):
 
     # Average the validation metric values over the number of batches and log to mlflow
     values = {k: v.item() / len(val_data) for k, v in values.items()}
-    mlflow.log_metrics(values)
+    mlflow.log_metrics(values, synchronous=False)
+
+
+@dataclasses.dataclass
+class TrainingConfig:
+    target_type: TargetType = TargetType.TASK
+    optimizer: Literal["sgd", "adam"] = "adam"
+    lr: float | Literal["auto"] = "auto"
+    val_patience: int = 3
+    val_every: int = 20
+    quick_val_batches: int = 10
+    max_steps: int = 10000
+    use_best_val: bool = True
+    smallest_reasonable_lr: float = 1e-8
+    largest_reasonable_lr: float = 0.1
+
+
+_DEFAULT_TRAINING_CONFIG = TrainingConfig()
+
+
+def training_helper(
+    modelAxB: GraphModulePlus,
+    modelA: GraphModulePlus,
+    modelB: GraphModulePlus,
+    train_data: DataLoader,
+    val_data: DataLoader,
+    frozen_modules: list[nn.Module],
+    parameters: Iterable[nn.Parameter],
+    logging_prefix: str,
+    config: TrainingConfig,
+    device: str | torch.device,
+):
+    # find the largest learning rate that does not cause the model to jump out of the loss incline
+    if config.lr == "auto":
+
+        def criterion(inputs, outputs, targets):
+            return loss_metrics_helper(
+                config.target_type, modelAxB, modelA, modelB, inputs, targets, outAxB=outputs
+            )[0]
+
+        parameters, tmp_parameters = itertools.tee(parameters)
+        if config.optimizer == "sgd":
+            optim = torch.optim.SGD(tmp_parameters, momentum=0.9, lr=1e-6)
+        elif config.optimizer == "adam":
+            optim = torch.optim.Adam(tmp_parameters, lr=1e-6)
+        else:
+            raise ValueError(
+                f"Learning rate finder only works with SGD or Adam optimizers, not {config.optimizer}"
+            )
+
+        lr_finder = LRFinder(modelAxB, optim, criterion=criterion, device=device)
+        lr_finder.range_test(
+            train_data,
+            start_lr=config.smallest_reasonable_lr / 10.0,
+            end_lr=config.largest_reasonable_lr * 10.0,
+            num_iter=100,
+            callback=lambda itr, lr, loss: mlflow.log_metrics(
+                {
+                    logging_prefix + "-lr-finder-lr": lr,
+                    logging_prefix + "-lr-finder-loss": loss,
+                },
+                step=itr,
+                synchronous=False,
+            ),
+        )
+        init_lr = min(
+            config.largest_reasonable_lr, max(config.smallest_reasonable_lr, lr_finder.suggestion())
+        )
+    else:
+        init_lr = config.lr
+
+    mlflow.log_metric(logging_prefix + "-init-lr", init_lr)
+
+    if config.optimizer == "sgd":
+        optimizer = torch.optim.SGD(parameters, lr=init_lr, momentum=0.9)
+    elif config.optimizer == "adam":
+        optimizer = torch.optim.Adam(parameters, lr=init_lr)
+    else:
+        raise ValueError(f"Unknown optimizer option {config.optimizer}")
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=config.val_patience,
+        min_lr=config.smallest_reasonable_lr,
+    )
+    val_loss_key = logging_prefix + "-modelAxB-quick-val-loss"
+
+    @torch.no_grad()
+    def quick_validation_loss(
+        val_data: DataLoader, max_batches: int | None = None, device: str | torch.device = "cuda"
+    ) -> dict[str, torch.Tensor]:
+        num_batches = len(val_data) if max_batches is None else min(len(val_data), max_batches)
+        metrics = defaultdict(lambda: torch.zeros(1, device=device))
+        for i, (im, la) in enumerate(val_data):
+            im, la = im.to(device, non_blocking=True), la.to(device, non_blocking=True)
+            loss, task_acc, task_ce = loss_metrics_helper(
+                config.target_type, modelAxB, modelA, modelB, im, la
+            )
+            metrics[logging_prefix + "-modelAxB-quick-val-loss"] += loss / num_batches
+            metrics[logging_prefix + "-modelAxB-quick-val-acc"] += task_acc / num_batches
+            metrics[logging_prefix + "-modelAxB-quick-val-ce"] += task_ce / num_batches
+
+            if i + 1 > num_batches:
+                break
+        return metrics
+
+    best_val, converged = float("inf"), False
+
+    with frozen(*frozen_modules):
+        step = 0
+
+        # The stitching layer must be trained to convergence to prevent the downstream learning
+        # from *picking up the slack* of the stitching layers unconverged training which would
+        # CONFOUND THE RESULTS!
+        while not (converged or step >= config.max_steps):
+            for im, la in tqdm(
+                train_data,
+                desc=f"Training[{logging_prefix}]",
+                initial=step,
+                total=config.max_steps,
+                leave=False,
+            ):
+                im, la = im.to(device, non_blocking=True), la.to(device, non_blocking=True)
+
+                optimizer.zero_grad()
+                loss, task_acc, task_ce = loss_metrics_helper(
+                    config.target_type, modelAxB, modelA, modelB, im, la
+                )
+                loss.backward()
+                optimizer.step()
+
+                if step % config.val_every == 0:
+                    val_metrics = quick_validation_loss(val_data, config.quick_val_batches, device)
+                    scheduler.step(val_metrics[val_loss_key])
+                    converged = all(
+                        group["lr"] <= init_lr * 1e-3 for group in optimizer.param_groups
+                    )
+
+                    mlflow.log_metrics(val_metrics, step=step, synchronous=False)
+
+                    if config.use_best_val and val_metrics[val_loss_key] < best_val:
+                        best_val = val_metrics[val_loss_key]
+                        best_snapshot = {
+                            k: v.detach().clone() for k, v in modelAxB.state_dict().items()
+                        }
+
+                    mlflow.log_metric(
+                        logging_prefix + "-lr", optimizer.param_groups[0]["lr"], step=step
+                    )
+
+                mlflow.log_metrics(
+                    {
+                        logging_prefix + "-modelAxB-train-loss": loss.detach(),
+                        logging_prefix + "-modelAxB-train-ce": task_ce.detach(),
+                        logging_prefix + "-modelAxB-train-acc": task_acc.detach(),
+                    },
+                    step=step,
+                    synchronous=False,
+                )
+
+                if converged or step >= config.max_steps:
+                    break
+
+                step += 1
+
+    if config.use_best_val:
+        modelAxB.load_state_dict(best_snapshot)
+
+    mlflow.log_metric(logging_prefix + " total steps", step)
+    mlflow.log_metric(logging_prefix + " converged", converged)
 
 
 def run_analysis(
     donorA: DonorSpec,
     donorB: DonorSpec,
     stitch_family: str,
-    stitch_init: str,
-    target_type: TargetType,
-    init_batches: int,
-    stitching_lr: float | Literal["auto"] = "auto",
-    downstream_lr: float | Literal["auto"] = "auto",
-    downstream_batches: int = 1000,
+    finetune_init: Literal[
+        "random", "regression", "regression+stitch", "random+stitch"
+    ] = "regression+stitch",
+    finetune_stitching_layer: bool = False,
+    init_batches: int = 1000,
+    stitching_config: TrainingConfig = _DEFAULT_TRAINING_CONFIG,
+    finetune_config: TrainingConfig = _DEFAULT_TRAINING_CONFIG,
     batch_size: int = 200,
     num_workers: int = 4,
-    device: torch.device | str = "cuda",
+    device: str | torch.device = "cuda",
 ):
-
-    # Save the string name in case we want to do a sanity check with the original model
-    donorBname = donorB.model
-
     # Set up models and data if not already initialized
     donorA.maybe_initialize()
     donorB.maybe_initialize()
@@ -253,12 +428,8 @@ def run_analysis(
         batch_size=batch_size, num_workers=num_workers, drop_last=True
     )
 
-    # Set number of downstream batches to one epoch
-    if downstream_batches is None:
-        downstream_batches = len(train_data)
-
     # Phase zero: regression-based initialization
-    if stitch_init != "skip0" or stitch_init != "skipAll":
+    if finetune_init in ["regression", "regression+stitch"]:
         run_regression_init(
             modelAxB, embedding_getter_A, embedding_getter_B, train_data, init_batches, device
         )
@@ -273,18 +444,27 @@ def run_analysis(
         device,
     )
 
-    # Phase 1: Train the stitching layer to convergence
-    if stitch_init != "skip1" or stitch_init != "skipAll":
-        train_stitching_layer_to_convergence(
-            modelAxB=modelAxB,
-            modelA=modelA,
-            modelB=modelB,
-            train_data=train_data,
-            target_type=target_type,
-            lr=stitching_lr,
-            max_steps=20000,
-            device=device,
-        )
+    ############################################
+    # Phase 1: Train the stitching layer alone #
+    ############################################
+    modelA.eval()
+    modelAxB.eval()
+    modelB.eval()
+    modelAxB.stitching_layer.train()
+
+    training_helper(
+        modelAxB=modelAxB,
+        modelA=modelA,
+        modelB=modelB,
+        train_data=train_data,
+        val_data=val_data,
+        frozen_modules=[modelA, modelB],
+        parameters=modelAxB.stitching_layer.parameters(),
+        logging_prefix="stitching",
+        config=stitching_config,
+        device=device,
+    )
+
     snapshot_and_test(
         model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
@@ -294,242 +474,42 @@ def run_analysis(
         device,
     )
 
-    # Phase 2: Train the downstream model
-    train_downstream_model(
-        modelAxB=modelAxB,
-        modelA=modelA,
-        modelB=modelB,
-        train_data=train_data,
-        target_type=target_type,
-        lr=downstream_lr,
-        max_steps=downstream_batches,
-        device=device,
-        downstream_name=donorBname,
-    )
-    snapshot_and_test(
-        model_hashes,
-        {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
-        val_data,
-        "downstream",
-        donorB.dataset.num_classes,
-        device,
-    )
-
-
-def train_downstream_model(
-    modelAxB: GraphModulePlus,
-    modelA: GraphModulePlus,
-    modelB: GraphModulePlus,
-    train_data: DataLoader,
-    target_type: TargetType,
-    max_steps: int,
-    device: str | torch.device,
-    downstream_name: str,
-    lr: float | Literal["Auto"] = "Auto",
-    lr_time_constant: float = 100.0,
-    parameter_convergence_eps: float = 1e-4,
-):
+    #######################################
+    # Phase 2: Train the downstream model #
+    #######################################
     modelA.eval()
     modelAxB.eval()
     modelB.train()
 
-    # If the target labels are from the downstream donor model B, then we need to make a deep copy of B
-    # Otherwise, because our stitching merges models together, the downstream training will change donor B's weights
-    # Thus changing the target labels and CONFOUNDING THE RESULTS!
-    if target_type == TargetType.MATCH_DOWNSTREAM:
-        # create new GraphModulePlus that will be deep copy of modelB to be the teacher for soft label training
-        modelB_teacher = deepcopy(modelB)
-        teacher_params_before = {k: v.clone() for k, v in modelB_teacher.named_parameters()}
-
-        # apply sanity to check to insure that the copy matches the pretrained model, if a downstream_name is given
-        if downstream_name is not None:
-            sanity_check_model = _get_pretrained_model_by_name(downstream_name)
-            sanity_check_model.to(device=device)
-            modelB_teacher.to(device=device)
-            sanity_params = {k: v.clone() for k, v in sanity_check_model.named_parameters()}
-
-            for k, v in sanity_check_model.named_parameters():
-                assert torch.allclose(
-                    sanity_params[k], teacher_params_before[k]
-                ), "pretrained model retrieved by name does not have matching parameters with the downstream model when they should be the same model"
-
+    if finetune_stitching_layer:
+        modelAxB.stitching_layer.train()
+        trainable_parameters = itertools.chain(
+            modelAxB.stitching_layer.parameters(), modelB.parameters()
+        )
     else:
-        modelB_teacher = None
+        trainable_parameters = modelB.parameters()
 
-    # quickly find the relatively best learning rate for the model to begin using
-    if lr == "auto":
-        optim = torch.optim.Adam(modelB.parameters(), lr=1e-6)
-        lr_finder = LRFinder(modelAxB, optim, criterion=torch.nn.CrossEntropyLoss(), device=device)
-        lr_finder.range_test(
-            train_data,
-            1e-9,
-            1e-1,
-            num_iter=100,
-            callback=lambda itr, lr, loss: mlflow.log_metrics(
-                {"downstream-lr-finder-lr": lr, "downstream-lr-finder-loss": loss}, step=itr
-            ),
-        )
-        lr = lr_finder.suggestion(stability_check=False)
-
-    mlflow.log_metric("downstream-init-lr", lr)
-    optimizer = torch.optim.Adam(modelB.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: 1 / (1 + step / lr_time_constant)
+    training_helper(
+        modelAxB=modelAxB,
+        modelA=modelA,
+        modelB=modelB,
+        train_data=train_data,
+        val_data=val_data,
+        frozen_modules=[modelA],
+        parameters=trainable_parameters,
+        logging_prefix="finetuning",
+        config=finetune_config,
+        device=device,
     )
-    converged = False
 
-    # Train the downstream component of the stiched modelAxB by freezing the components from
-    # model A and freezing the stitching layer
-    optimizer = torch.optim.Adam(modelB.parameters(), lr=lr)
-    with frozen(modelA, modelAxB.stitching_layer):
-        step = 0
-        last_params = {k: v.detach().clone() for k, v in modelAxB.named_parameters()}
-
-        while not (converged or step >= max_steps):
-            for im, la in tqdm(train_data, total=max_steps, desc="Fine-tuning"):
-
-                im, la = im.to(device), la.to(device)
-
-                loss, task_acc, task_ce = loss_metrics_helper(
-                    target_type, modelAxB, modelA, modelB_teacher, im, la
-                )
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-
-                new_params = {k: v.detach().clone() for k, v in modelAxB.named_parameters()}
-                with torch.no_grad():
-                    delta_params = torch.tensor(
-                        [
-                            (new_p - last_p).abs().max()
-                            for new_p, last_p in zip(new_params.values(), last_params.values())
-                        ]
-                    ).max()
-                    last_params = new_params
-
-                if step % 100 == 0:
-                    print(f"Step: {step}\tLoss: {loss.item()}\tDelta params: {delta_params.item()}")
-
-                mlflow.log_metric("downstream-modelAxB-train-loss", loss.detach(), step=step)
-                mlflow.log_metric("downstream-modelAxB-train-ce", task_ce.detach(), step=step)
-                mlflow.log_metric("downstream-modelAxB-train-acc", task_acc.detach(), step=step)
-                mlflow.log_metric("downstream-delta-params", delta_params.detach(), step=step)
-
-                if delta_params < parameter_convergence_eps:
-                    converged = True
-
-                if step >= max_steps:
-
-                    break
-
-                step += 1
-
-    mlflow.log_metric("steps to train downstream component", step)
-    mlflow.log_metric("downstream component converged", converged)
-
-    # sanity_check that the tensor clone function worked to make a deepcopy
-    if target_type == TargetType.MATCH_DOWNSTREAM:
-        teacher_params_after = {k: v.clone() for k, v in modelB_teacher.named_parameters()}
-
-        for k, v in modelB.named_parameters():
-            assert torch.allclose(
-                teacher_params_before[k], teacher_params_after[k]
-            ), "The deep copy of the downstream model used as optimization target was unexpectedly changed "
-
-
-def train_stitching_layer_to_convergence(
-    modelAxB: GraphModulePlus,
-    modelA: GraphModulePlus,
-    modelB: GraphModulePlus,
-    train_data: DataLoader,
-    target_type: TargetType,
-    max_steps: int,
-    lr: float | Literal["auto"] = "auto",
-    lr_time_constant: float = 100.0,
-    parameter_convergence_eps: float = 1e-4,
-    device: str | torch.device = "cuda",
-):
-    modelA.eval()
-    modelB.eval()
-    modelAxB.stitching_layer.train()
-
-    # find the largest learning rate that does not cause the model to jump out of the loss incline
-    if lr == "auto":
-        optim = torch.optim.Adam(modelAxB.stitching_layer.parameters(), lr=1e-6)
-        lr_finder = LRFinder(modelAxB, optim, criterion=torch.nn.CrossEntropyLoss(), device=device)
-        lr_finder.range_test(
-            train_data,
-            1e-9,
-            1e-1,
-            num_iter=100,
-            callback=lambda itr, lr, loss: mlflow.log_metrics(
-                {"stitching-lr-finder-lr": lr, "stitching-lr-finder-loss": loss}, step=itr
-            ),
-        )
-        lr = lr_finder.suggestion(stability_check=False)
-
-    mlflow.log_metric("stitching-init-lr", lr)
-    optimizer = torch.optim.Adam(modelAxB.stitching_layer.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: 1 / (1 + step / lr_time_constant)
+    snapshot_and_test(
+        model_hashes,
+        {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
+        val_data,
+        "finetuning",
+        donorB.dataset.num_classes,
+        device,
     )
-    converged = False
-
-    # Train only the stitching layer by keeping all layers from Model A and all layers from Model B frozen
-    with frozen(modelA, modelB):
-        step = 0
-        last_params = {
-            k: v.detach().clone() for k, v in modelAxB.stitching_layer.named_parameters()
-        }
-
-        # The stitching layer must be trained to convergence to prevent the downstream learning
-        # from *picking up the slack* of the stitching layers unconverged training which would
-        # CONFOUND THE RESULTS!
-        while not (converged or step >= max_steps):
-            for im, la in train_data:
-                im, la = im.to(device), la.to(device)
-
-                loss, task_acc, task_ce = loss_metrics_helper(
-                    target_type, modelAxB, modelA, modelB, im, la
-                )
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-
-                new_params = {
-                    k: v.detach().clone() for k, v in modelAxB.stitching_layer.named_parameters()
-                }
-                with torch.no_grad():
-                    delta_params = torch.tensor(
-                        [
-                            (new_p - last_p).abs().max()
-                            for new_p, last_p in zip(new_params.values(), last_params.values())
-                        ]
-                    ).max()
-                    last_params = new_params
-
-                if step % 100 == 0:
-                    print(f"Step: {step}\tLoss: {loss.item()}\tDelta params: {delta_params.item()}")
-
-                mlflow.log_metric("stitching-modelAxB-train-loss", loss.detach(), step=step)
-                mlflow.log_metric("stitching-modelAxB-train-ce", task_ce.detach(), step=step)
-                mlflow.log_metric("stitching-modelAxB-train-acc", task_acc.detach(), step=step)
-                mlflow.log_metric("stitching-delta-params", delta_params.detach(), step=step)
-
-                if delta_params < parameter_convergence_eps:
-                    converged = True
-
-                if converged or step >= max_steps:
-                    break
-
-                step += 1
-
-    mlflow.log_metric("steps to train stitching layer", step)
-    mlflow.log_metric("stitching layer converged", converged)
 
 
 @torch.no_grad()
@@ -545,7 +525,7 @@ def run_regression_init(
         if i >= init_batches:
             break
 
-        im = im.to(device)
+        im = im.to(device, non_blocking=True)
         modelAxB.stitching_layer.init_by_regression(
             embedding_getter_A(im),
             embedding_getter_B(im),
@@ -560,8 +540,8 @@ def _flatten_dict(d: dict, key_sep="_") -> dict:
 
     def flatten(x: dict, name: str = ""):
         if isinstance(x, dict):
-            for a in x:
-                flatten(x[a], name + a + key_sep)
+            for key, val in x.items():
+                flatten(val, name + key + key_sep)
         else:
             if name[:-1] in out:
                 raise ValueError(f"Duplicate key created during flattening: {name[:-1]}")
@@ -572,7 +552,12 @@ def _flatten_dict(d: dict, key_sep="_") -> dict:
 
 
 if __name__ == "__main__":
+    import os
+
     import jsonargparse
+    from dotenv import load_dotenv
+
+    load_dotenv()  # loads .env file into environment variables
 
     parser = jsonargparse.ArgumentParser(
         prog="learnable-stitching experiment",
@@ -580,36 +565,33 @@ if __name__ == "__main__":
         "then apply downstream learning with respect to given dataset and set label type",
     )
     parser.add_function_arguments(run_analysis)
+    parser.add_argument("--mlflow_experiment", type=str, default="debug")
+    parser.add_argument("--config", action="config")
     args = parser.parse_args()
-    print(args)
 
-    experiment_name = "learnable-stitching-v0.4"
-    mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
+    # The --config argument has done its job at this point, so we remove it from the args
+    # namespace to avoid passing it to run_analysis.
+    args.pop("config")
+
+    user = os.getenv("MLFLOW_SQL_USERNAME")
+    password = os.getenv("MLFLOW_SQL_PASSWORD")
+    db_name = os.getenv("MLFLOW_SQL_DATABASE")
+
+    mlflow.set_tracking_uri(f"mysql+pymysql://{user}:{password}@localhost:3306/{db_name}")
+    experiment_name = args.pop("mlflow_experiment")
+    if not mlflow.get_experiment_by_name(experiment_name):
+        mlflow.create_experiment(
+            experiment_name, artifact_location=f"/projects/learnable-stitching/{experiment_name}/"
+        )
     mlflow.set_experiment(experiment_name)
 
-    # check if the experiment parameters have been already been run
-    params = _flatten_dict(args.as_dict())
-
-    prior_runs = search_runs_by_params(
-        experiment_name=experiment_name,
-        finished_only=True,
-        params=params,
-        skip_keys={"device": ..., "num_workers": ...},
-    )
-    if not prior_runs.empty:
-        print("Experiment already run with these parameters. Exiting.")
-        exit(0)
+    index = RunIndex.from_experiment(args, experiment_names=[experiment_name])
+    if args in index:
+        print(f"Run with parameters {args} already exists in experiment {experiment_name}.")
+        sys.exit(0)
 
     # set up run name
-    match params["target_type"]:
-        case TargetType.TASK:
-            task_name = "task"
-        case TargetType.MATCH_UPSTREAM:
-            task_name = "upstream"
-        case TargetType.MATCH_DOWNSTREAM:
-            task_name = "downstream"
-        case _:
-            assert_never(params["target_type"])
+    params = _flatten_dict(args.as_dict())
 
     run_name = (
         params["donorA_model"]
@@ -626,12 +608,11 @@ if __name__ == "__main__":
         + "-"
         + params["stitch_family"]
         + "_"
-        + task_name
+        + str(params["stitching_config_target_type"]).split(".")[-1].lower()
         + "_"
-        + params["stitch_init"]
+        + params["finetune_init"]
     )
 
     # set up mlflow to record the run, log parameter experiments, and start the process to generate data for learnable stitching experiment
-    with mlflow.start_run(run_name=run_name):
-        mlflow.log_params(_flatten_dict(args.as_dict()))
-        run_analysis(**parser.instantiate_classes(args).as_dict())
+    with logged_run(args, index):
+        run_analysis(**parser.instantiate(args).as_dict())
