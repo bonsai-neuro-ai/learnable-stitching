@@ -65,7 +65,7 @@ class DonorSpec:
 
 
 def create_hybrid_model(
-    donorA: DonorSpec, donorB: DonorSpec, stitch_family: str, plot_architecture: bool = False
+        donorA: DonorSpec, donorB: DonorSpec, stitch_family: str, plot_architecture: bool = False
 ) -> tuple[GraphModulePlus, GraphModulePlus, GraphModulePlus]:
     """Initializes a stitched model, inferring the shapes of the layers to be stitched.
 
@@ -127,13 +127,13 @@ def create_hybrid_model(
 
 
 def loss_metrics_helper(
-    target_type: TargetType,
-    modelAxB: nn.Module,
-    modelA: nn.Module,
-    modelB: nn.Module,
-    im: torch.Tensor,
-    la: torch.Tensor,
-    outAxB: torch.Tensor | None = None,
+        target_type: TargetType,
+        modelAxB: nn.Module,
+        modelA: nn.Module,
+        modelB: nn.Module,
+        im: torch.Tensor,
+        la: torch.Tensor,
+        outAxB: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Helper function to compute loss and metrics for the given target type."""
     if outAxB is None:
@@ -228,16 +228,16 @@ _DEFAULT_TRAINING_CONFIG = TrainingConfig()
 
 
 def training_helper(
-    modelAxB: GraphModulePlus,
-    modelA: GraphModulePlus,
-    modelB: GraphModulePlus,
-    train_data: DataLoader,
-    val_data: DataLoader,
-    frozen_modules: list[nn.Module],
-    parameters: Iterable[nn.Parameter],
-    logging_prefix: str,
-    config: TrainingConfig,
-    device: str | torch.device,
+        modelAxB: GraphModulePlus,
+        modelA: GraphModulePlus,
+        modelB: GraphModulePlus,
+        train_data: DataLoader,
+        val_data: DataLoader,
+        frozen_modules: list[nn.Module],
+        parameters: Iterable[nn.Parameter],
+        logging_prefix: str,
+        config: TrainingConfig,
+        device: str | torch.device,
 ):
     # find the largest learning rate that does not cause the model to jump out of the loss incline
     if config.lr == "auto":
@@ -284,6 +284,8 @@ def training_helper(
 
     mlflow.log_metric(logging_prefix + "-init-lr", init_lr)
 
+    converged_lr = max(init_lr / 1000, config.smallest_reasonable_lr / 2)
+
     if config.optimizer == "sgd":
         optimizer = torch.optim.SGD(parameters, lr=init_lr, momentum=0.9)
     elif config.optimizer == "adam":
@@ -296,18 +298,23 @@ def training_helper(
         mode="min",
         factor=0.5,
         patience=config.val_patience,
-        min_lr=config.smallest_reasonable_lr,
+        # avoid floating point issues with <= comparisons
+        min_lr=converged_lr / 1.0000000001,
+        # we do our own LR < min_LR check; disable the 'eps' in the scheduler to avoid it
+        # refusing to make the LR small (which then causes us to never 'converge')
+        eps=0.0,
     )
     val_loss_key = logging_prefix + "-modelAxB-quick-val-loss"
 
     @torch.no_grad()
     def quick_validation_loss(
-        val_data: DataLoader, max_batches: int | None = None, device: str | torch.device = "cuda"
+            val_data_: DataLoader, max_batches: int | None = None,
+            device_: str | torch.device = "cuda"
     ) -> dict[str, torch.Tensor]:
-        num_batches = len(val_data) if max_batches is None else min(len(val_data), max_batches)
-        metrics = defaultdict(lambda: torch.zeros(1, device=device))
-        for i, (im, la) in enumerate(val_data):
-            im, la = im.to(device, non_blocking=True), la.to(device, non_blocking=True)
+        num_batches = len(val_data_) if max_batches is None else min(len(val_data_), max_batches)
+        metrics = defaultdict(lambda: torch.zeros(1, device=device_))
+        for i, (im, la) in enumerate(val_data_):
+            im, la = im.to(device_, non_blocking=True), la.to(device_, non_blocking=True)
             loss, task_acc, task_ce = loss_metrics_helper(
                 config.target_type, modelAxB, modelA, modelB, im, la
             )
@@ -315,11 +322,14 @@ def training_helper(
             metrics[logging_prefix + "-modelAxB-quick-val-acc"] += task_acc / num_batches
             metrics[logging_prefix + "-modelAxB-quick-val-ce"] += task_ce / num_batches
 
-            if i + 1 > num_batches:
+            if i + 1 >= num_batches:
                 break
         return metrics
 
-    best_val, converged = float("inf"), False
+    best_val, converged, errored = float("inf"), False, False
+    best_snapshot = {
+        k: v.detach().clone() for k, v in modelAxB.state_dict().items()
+    }
 
     with frozen(*frozen_modules):
         step = 0
@@ -327,13 +337,13 @@ def training_helper(
         # The stitching layer must be trained to convergence to prevent the downstream learning
         # from *picking up the slack* of the stitching layers unconverged training which would
         # CONFOUND THE RESULTS!
-        while not (converged or step >= config.max_steps):
+        while not (converged or errored or step >= config.max_steps):
             for im, la in tqdm(
-                train_data,
-                desc=f"Training[{logging_prefix}]",
-                initial=step,
-                total=config.max_steps,
-                leave=False,
+                    train_data,
+                    desc=f"Training[{logging_prefix}]",
+                    initial=step,
+                    total=config.max_steps,
+                    leave=False,
             ):
                 im, la = im.to(device, non_blocking=True), la.to(device, non_blocking=True)
 
@@ -347,17 +357,19 @@ def training_helper(
                 if step % config.val_every == 0:
                     val_metrics = quick_validation_loss(val_data, config.quick_val_batches, device)
                     scheduler.step(val_metrics[val_loss_key])
-                    converged = all(
-                        group["lr"] <= init_lr * 1e-3 for group in optimizer.param_groups
-                    )
+                    converged = all(group["lr"] <= converged_lr for group in optimizer.param_groups)
 
                     mlflow.log_metrics(val_metrics, step=step, synchronous=False)
 
-                    if config.use_best_val and val_metrics[val_loss_key] < best_val:
+                    if val_metrics[val_loss_key] < best_val:
                         best_val = val_metrics[val_loss_key]
                         best_snapshot = {
                             k: v.detach().clone() for k, v in modelAxB.state_dict().items()
                         }
+
+                    if not all(map(torch.isfinite, val_metrics.values())):
+                        errored = True
+                        break
 
                     mlflow.log_metric(
                         logging_prefix + "-lr", optimizer.param_groups[0]["lr"], step=step
@@ -378,27 +390,28 @@ def training_helper(
 
                 step += 1
 
-    if config.use_best_val:
+    if config.use_best_val or errored:
         modelAxB.load_state_dict(best_snapshot)
 
     mlflow.log_metric(logging_prefix + " total steps", step)
     mlflow.log_metric(logging_prefix + " converged", converged)
+    mlflow.log_metric(logging_prefix + " errored", errored)
 
 
 def run_analysis(
-    donorA: DonorSpec,
-    donorB: DonorSpec,
-    stitch_family: str,
-    finetune_init: Literal[
-        "random", "regression", "regression+stitch", "random+stitch"
-    ] = "regression+stitch",
-    finetune_stitching_layer: bool = False,
-    init_batches: int = 1000,
-    stitching_config: TrainingConfig = _DEFAULT_TRAINING_CONFIG,
-    finetune_config: TrainingConfig = _DEFAULT_TRAINING_CONFIG,
-    batch_size: int = 200,
-    num_workers: int = 4,
-    device: str | torch.device = "cuda",
+        donorA: DonorSpec,
+        donorB: DonorSpec,
+        stitch_family: str,
+        finetune_init: Literal[
+            "random", "regression", "regression+stitch", "random+stitch"
+        ] = "regression+stitch",
+        finetune_stitching_layer: bool = False,
+        init_batches: int = 1000,
+        stitching_config: TrainingConfig = _DEFAULT_TRAINING_CONFIG,
+        finetune_config: TrainingConfig = _DEFAULT_TRAINING_CONFIG,
+        batch_size: int = 200,
+        num_workers: int = 4,
+        device: str | torch.device = "cuda",
 ):
     # Set up models and data if not already initialized
     donorA.maybe_initialize()
@@ -519,12 +532,12 @@ def run_analysis(
 
 @torch.no_grad()
 def run_regression_init(
-    modelAxB: GraphModulePlus,
-    embedding_getter_A: GraphModulePlus,
-    embedding_getter_B: GraphModulePlus,
-    train_data: DataLoader,
-    init_batches: int,
-    device: str | torch.device,
+        modelAxB: GraphModulePlus,
+        embedding_getter_A: GraphModulePlus,
+        embedding_getter_B: GraphModulePlus,
+        train_data: DataLoader,
+        init_batches: int,
+        device: str | torch.device,
 ):
     for i, (im, la) in enumerate(tqdm(train_data, total=init_batches, desc="Regression init")):
         if i >= init_batches:
@@ -567,7 +580,7 @@ if __name__ == "__main__":
     parser = jsonargparse.ArgumentParser(
         prog="learnable-stitching experiment",
         description="Create an amalgam of stiched models between two given pretrained models "
-        "then apply downstream learning with respect to given dataset and set label type",
+                    "then apply downstream learning with respect to given dataset and set label type",
     )
     parser.add_function_arguments(run_analysis)
     parser.add_argument("--mlflow_experiment", type=str, default="debug")
@@ -599,23 +612,23 @@ if __name__ == "__main__":
     params = _flatten_dict(args.as_dict())
 
     run_name = (
-        params["donorA_model"]
-        + "_"
-        + params["donorA_layer"]
-        + "_"
-        + params["donorA_dataset"]
-        + "-X-"
-        + params["donorB_model"]
-        + "_"
-        + params["donorB_layer"]
-        + "_"
-        + params["donorB_dataset"]
-        + "-"
-        + params["stitch_family"]
-        + "_"
-        + str(params["stitching_config_target_type"]).split(".")[-1].lower()
-        + "_"
-        + params["finetune_init"]
+            params["donorA_model"]
+            + "_"
+            + params["donorA_layer"]
+            + "_"
+            + params["donorA_dataset"]
+            + "-X-"
+            + params["donorB_model"]
+            + "_"
+            + params["donorB_layer"]
+            + "_"
+            + params["donorB_dataset"]
+            + "-"
+            + params["stitch_family"]
+            + "_"
+            + str(params["stitching_config_target_type"]).split(".")[-1].lower()
+            + "_"
+            + params["finetune_init"]
     )
 
     # set up mlflow to record the run, log parameter experiments, and start the process to generate data for learnable stitching experiment
