@@ -4,14 +4,14 @@ TARGETS=(
 )
 
 MODELA="resnet18"
-MODELB="resnet50"
+MODELB="fcn_resnet50"
 
 LAYERSA=(
     "add_4"
 )
 
 LAYERSB=(
-    "add"
+    "add_2"
 )
 
 
@@ -24,13 +24,14 @@ LAYERSB=(
             --donorA.dataset="imagenet" \
             --donorB.model="$MODELB" \
             --donorB.layer="$LAYERB" \
-            --donorB.dataset="imagenet" \
+            --donorB.dataset="coco" \
             --stitch_family="1x1Conv" \
             --target_type="$TARGET" \
+            --stitch_init="skip_none" \
             --init_batches=10 \
             --downstream_batches=1000 \
             --batch_size=200 \
-            --num_workers=4
+            --num_workers=4 || exit 1
           done
         done
       done

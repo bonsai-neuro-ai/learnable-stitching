@@ -10,7 +10,7 @@ import torch
 import torch.fx.graph
 import torch.nn as nn
 from graphene.utils.dataloader import DataLoader
-from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase
+from nn_lib.datasets import ImageNetDataModule, TorchvisionDataModuleBase, CocoDetectionDataModule
 from nn_lib.models import get_pretrained_model
 from nn_lib.models.graph_module_plus import GraphModulePlus
 from nn_lib.utils.models import frozen
@@ -20,8 +20,9 @@ from torchmetrics import Accuracy
 from tqdm.auto import tqdm
 
 from stitching import create_stitching_layer
-from os import path
+from os import path, makedirs
 
+import torchvision.datasets as tvd
 
 
 def _get_pretrained_model_by_name(model_name: str) -> GraphModulePlus:
@@ -37,6 +38,12 @@ def _get_dataset_by_name(dataset_name: str) -> TorchvisionDataModuleBase:
             # Imagenet has about 1.2M training images, which we'll split so that we get about 5k
             # validation images. Warning: no checks are done to ensure that the split is balanced.
             dm = ImageNetDataModule(root_dir="/data/datasets/", train_val_split=0.99)
+            dm.prepare_data()
+            return dm
+        case "coco":
+            # MSCOCO TODO: add more to this comment
+            # TODO: create a pytorch data module subclass for COCO
+            dm = CocoDetectionDataModule(root_dir="/data/datasets/", train_val_split=0.99)
             dm.prepare_data()
             return dm
         case _:
@@ -119,8 +126,15 @@ def create_hybrid_model(
     )
 
     image = modelAxB.to_dot().create_png(prog="dot")
-    dir_path = mlflow.get_artifact_uri("hybrid-model.png")
-    with open(mlflow.get_artifact_uri("hybrid-model.png"), "wb") as f:
+    #dir_path = mlflow.get_artifact_uri("hybrid-model.png")
+
+    run = mlflow.active_run()
+    dir_path = "/data/projects/learnable-stitching/artifacts/" + run.info.run_id
+
+    artifact_path = path.dirname(dir_path)
+    makedirs(artifact_path, exist_ok=True)
+    
+    with open(artifact_path + "/hybrid-model.png" , "wb") as f:
         f.write(image)
 
     return modelAxB, donorA_embedding_getter, donorB_embedding_getter
@@ -207,7 +221,7 @@ def snapshot_and_test(hashes, models, val_data, prefix, num_classes, device):
 
 def run_analysis(
     donorA: DonorSpec,
-    donorB: DonorSpec,
+    donorB: DonorSpec, 
     stitch_family: str,
     stitch_init: str, 
     target_type: TargetType,
@@ -261,7 +275,7 @@ def run_analysis(
         downstream_batches = len(train_data)
 
     # Phase zero: regression-based initialization
-    if stitch_init != "skip0" or stitch_init != "skipAll":
+    if stitch_init != "skip_0" and stitch_init != "skip_all":
         run_regression_init(
             modelAxB, embedding_getter_A, embedding_getter_B, train_data, init_batches, device
         )
@@ -277,7 +291,7 @@ def run_analysis(
     )
 
     # Phase 1: Train the stitching layer to convergence
-    if stitch_init != "skip1" or stitch_init != "skipAll":
+    if stitch_init != "skip_1" and stitch_init != "skip_all":
             train_stitching_layer_to_convergence(
                 modelAxB=modelAxB,
                 modelA=modelA,
@@ -592,7 +606,7 @@ if __name__ == "__main__":
     print(args)
 
     experiment_name = "learnable-stitching-v0.4"
-    mlflow.set_tracking_uri("/data/projects/learnable-stitching/mlruns")
+    mlflow.set_tracking_uri("sqlite:////data/projects/learnable-stitching/mlflow.db")
     mlflow.set_experiment(experiment_name)
 
     # check if the experiment parameters have been already been run

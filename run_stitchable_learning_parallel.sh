@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-MODELS=(
+MODELSA=(
+  "fcn_resnet50"
+)
+
+MODELSB=(
   "resnet18"
   "resnet34"
   "resnet50"
@@ -11,7 +15,7 @@ TARGETS=(
   MATCH_UPSTREAM
 )
 
-while getopts "c:t:" opt; do
+while getopts "c:t:s:" opt; do
   case $opt in
 	c)
   	device="$OPTARG"
@@ -21,14 +25,18 @@ while getopts "c:t:" opt; do
   	target_task="$OPTARG"
   	echo "TARGET: $target_task"
   	;;
+	s)
+  	stitch_init="$OPTARG"
+  	echo "stitch init: $stitch_init"
+  	;;
   esac
 done
 
-for MODELA in "${MODELS[@]}"; do
-  LAYERSA=($(python3 -m model_info $MODELA --layers | grep "add"))
-  for MODELB in "${MODELS[@]}"; do
+for MODELA in "${MODELSA[@]}"; do
+  LAYERSA=($(python3 -m model_info $MODELA --layers "odd" | grep "add"))
+  for MODELB in "${MODELSB[@]}"; do
     if [ "$MODELA" = "$MODELB" ]; then continue; fi
-    LAYERSB=($(python3 -m model_info $MODELB --layers | grep "add"))
+    LAYERSB=($(python3 -m model_info $MODELB --layers "odd" | grep "add"))
     for LAYERA in "${LAYERSA[@]}"; do
       for LAYERB in "${LAYERSB[@]}"; do
           CUDA_VISIBLE_DEVICES="$device" python3 experiment.py \
@@ -39,12 +47,12 @@ for MODELA in "${MODELS[@]}"; do
             --donorB.layer="$LAYERB" \
             --donorB.dataset="imagenet" \
             --stitch_family="1x1Conv" \
-            --stitch_init="skipAll" \
+            --stitch_init="$stitch_init" \
             --target_type="$target_task" \
             --init_batches=10 \
             --downstream_batches=1000 \
             --batch_size=200 \
-            --num_workers=4 
+            --num_workers=4 || exit 1
         done
       done
   done

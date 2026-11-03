@@ -18,8 +18,6 @@ xy_a = torch.cartesian_prod(torch.linspace(-1, 1, 16), torch.linspace(-1, 1, 16)
 labels = ((xy_a[:, 0] * xy_a[:, 1]) > 0).long()  # XOR labels
 
 # %% Construct activations for model B by defining an invertible function of xy space which will break A into 'tiles'
-
-
 def a_to_b(xy: torch.Tensor) -> torch.Tensor:
     out = xy.clone()
     x, y = xy[:, 0], xy[:, 1]
