@@ -1,0 +1,30 @@
+mlflow_experiment: "better_convergence"
+batch_size: 200
+device: cuda
+finetune_init: "regression+stitch"
+init_batches: 100
+num_workers: 4
+stitch_family: "1x1Conv"
+stitching_config:
+  largest_reasonable_lr: 0.1
+  lr: "auto"
+  max_steps: 10000
+  optimizer: "adam"
+  quick_val_batches: 10
+  smallest_reasonable_lr: 1.0e-08
+  target_type: "TASK"
+  use_best_val: true
+  val_every: 20
+  val_patience: 3
+finetune_stitching_layer: false
+finetune_config:
+  largest_reasonable_lr: 0.1
+  lr: "auto"
+  max_steps: 10000
+  optimizer: "adam"
+  quick_val_batches: 10
+  smallest_reasonable_lr: 1.0e-08
+  target_type: "TASK"
+  use_best_val: true
+  val_every: 20
+  val_patience: 3
