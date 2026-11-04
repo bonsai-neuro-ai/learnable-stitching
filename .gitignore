@@ -185,3 +185,6 @@ big_df.csv
 .vscode/*
 
 test.txt
+
+# ignore ports of prototype libraries
+nn_lib/*
