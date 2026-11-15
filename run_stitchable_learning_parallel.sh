@@ -42,17 +42,15 @@ for MODELA in "${MODELSA[@]}"; do
           CUDA_VISIBLE_DEVICES="$device" python3 experiment.py \
             --donorA.model="$MODELA" \
             --donorA.layer="$LAYERA" \
-            --donorA.dataset="imagenet" \
+            --donorA.dataset="coco" \
             --donorB.model="$MODELB" \
             --donorB.layer="$LAYERB" \
             --donorB.dataset="imagenet" \
             --stitch_family="1x1Conv" \
-            --stitch_init="$stitch_init" \
-            --target_type="$target_task" \
-            --init_batches=10 \
-            --downstream_batches=1000 \
+            --finetune_init="$stitch_init" \
             --batch_size=200 \
-            --num_workers=4 || exit 1
+            --num_workers=4 \
+            --mlflow_experiment="learnable-stitching-v0.5" || exit 1
         done
       done
   done

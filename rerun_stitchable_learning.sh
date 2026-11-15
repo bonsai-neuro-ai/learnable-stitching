@@ -3,8 +3,9 @@ TARGETS=(
   TASK
 )
 
-MODELA="resnet18"
 MODELB="fcn_resnet50"
+MODELA="resnet18"
+
 
 LAYERSA=(
     "add_4"
@@ -14,25 +15,21 @@ LAYERSB=(
     "add_2"
 )
 
-
-    for LAYERA in "${LAYERSA[@]}"; do
-      for LAYERB in "${LAYERSB[@]}"; do
-        for TARGET in "${TARGETS[@]}"; do
-          CUDA_VISIBLE_DEVICES=2 python3 experiment.py \
-            --donorA.model="$MODELA" \
-            --donorA.layer="$LAYERA" \
-            --donorA.dataset="imagenet" \
-            --donorB.model="$MODELB" \
-            --donorB.layer="$LAYERB" \
-            --donorB.dataset="coco" \
-            --stitch_family="1x1Conv" \
-            --target_type="$TARGET" \
-            --stitch_init="skip_none" \
-            --init_batches=10 \
-            --downstream_batches=1000 \
-            --batch_size=200 \
-            --num_workers=4 || exit 1
-          done
-        done
+for LAYERA in "${LAYERSA[@]}"; do
+  for LAYERB in "${LAYERSB[@]}"; do
+    for TARGET in "${TARGETS[@]}"; do
+      CUDA_VISIBLE_DEVICES=0 python3 experiment.py \
+        --donorA.model="$MODELA" \
+        --donorA.layer="$LAYERA" \
+        --donorA.dataset="imagenet" \
+        --donorB.model="$MODELB" \
+        --donorB.layer="$LAYERB" \
+        --donorB.dataset="coco" \
+        --stitch_family="1x1Conv" \
+        --finetune_init="regression+stitch" \
+        --init_batches=10 \
+        --batch_size=75 \
+        --num_workers=4 || exit 1
       done
+    done
   done

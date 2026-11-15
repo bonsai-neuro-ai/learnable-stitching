@@ -64,14 +64,19 @@ class DonorSpec:
 
     def maybe_initialize(self) -> Self:
         if isinstance(self.model, str):
+            model_name = self.model
             self.model = _get_pretrained_model_by_name(self.model)
+
+            if model_name in ["fcn_resnet50"]:
+                self.model = self.model.set_output("interpolate")
         if isinstance(self.dataset, str):
+            self.dataset_name = self.dataset
             self.dataset = _get_dataset_by_name(self.dataset)
         return self
 
 
 def create_hybrid_model(
-        donorA: DonorSpec, donorB: DonorSpec, stitch_family: str, plot_architecture: bool = False
+        donorA: DonorSpec, donorB: DonorSpec, stitch_family: str, plot_architecture: bool = True
 ) -> tuple[GraphModulePlus, GraphModulePlus, GraphModulePlus]:
     """Initializes a stitched model, inferring the shapes of the layers to be stitched.
 
@@ -90,25 +95,32 @@ def create_hybrid_model(
     donorB.maybe_initialize()
 
     # Run dummy data through modelA up to layerA to get its shape
-    donorA_embedding_getter = GraphModulePlus.new_from_copy(donorA.model).set_output(donorA.layer)
+    donorA_embedding_getter = GraphModulePlus.new_from_copy(donorA.model).extract_subgraph(output=donorA.layer)
     dataA_shape = donorA.dataset.shape
-    repA_shape = donorA_embedding_getter(torch.zeros((1,) + dataA_shape)).shape
+    dataB_shape = donorB.dataset.shape
+    repA_shape = donorA_embedding_getter(torch.zeros((1,) + dataB_shape)).shape
+
 
     # Run dummy data through modelB up to layerB to get its shape
-    donorB_embedding_getter = GraphModulePlus.new_from_copy(donorB.model).set_output(donorB.layer)
+    donorB_embedding_getter = GraphModulePlus.new_from_copy(donorB.model).extract_subgraph(output=donorB.layer)
     dataB_shape = donorB.dataset.shape
     repB_shape = donorB_embedding_getter(torch.zeros((1,) + dataB_shape)).shape
+
+    #print("representation shapes", repA_shape, repB_shape)
 
     # Initialize the stitching layer
     stitching_layer = create_stitching_layer(repA_shape[1:], repB_shape[1:], stitch_family)
 
+    donorB.model.eval()
     # sanity-check that the stiching layer is the correct size
+    repB_shape = donorB_embedding_getter(torch.zeros((1,) + dataB_shape)).shape
     assert stitching_layer(torch.zeros(repA_shape)).shape == repB_shape
 
     # retrieve next node for stitching the graph
     layerB_next = donorB.model.users_of(donorB.layer)
     assert len(layerB_next) == 1, "Stitching layers with |users| != 1 not supported"
     layerB_next = layerB_next[0].name
+    
 
     # Stitch the stitching layer to the bottom of A_ subgraph
     modelAxB = GraphModulePlus.new_from_merge(
@@ -120,6 +132,7 @@ def create_hybrid_model(
         auto_trace=False,
     )
 
+
     if plot_architecture:
         image = donorA.model.to_dot().create_png(prog="dot")
         with open("donorA-computation-map.png", "wb") as f:
@@ -127,6 +140,9 @@ def create_hybrid_model(
 
         image = modelAxB.to_dot().create_png(prog="dot")
         with open(mlflow.get_artifact_uri("hybrid-model.png"), "wb") as f:
+            f.write(image)
+
+        with open("hybrid-model.png", "wb") as f:
             f.write(image)
 
     return modelAxB, donorA_embedding_getter, donorB_embedding_getter
@@ -144,8 +160,8 @@ def loss_metrics_helper(
     """Helper function to compute loss and metrics for the given target type."""
     if outAxB is None:
         outAxB = modelAxB(im)
-    task_acc = (torch.argmax(outAxB, dim=-1) == la).float().mean()
-    task_ce = nn.functional.cross_entropy(outAxB, la)
+    task_acc = (torch.argmax(outAxB, dim=1) == la).float().mean()
+    task_ce = nn.functional.cross_entropy(outAxB, la, ignore_index=255)
     match target_type:
         case TargetType.TASK:
             loss = task_ce
@@ -168,7 +184,7 @@ def _hash_tensor(tensor: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def snapshot_and_test(hashes, models, val_data, prefix, num_classes, device):
+def snapshot_and_test(hashes, models, val_data, ds_names, prefix, num_classes, device):
     """Snapshot params and run validation."""
     # Saving all three models so we can run sanity-checks later that only the parameters we
     # wanted to change actually changed in each phase.
@@ -185,31 +201,61 @@ def snapshot_and_test(hashes, models, val_data, prefix, num_classes, device):
 
     # the metrics listed are measured on the validation set of the data
     metrics = {
-        "acc1": Accuracy("multiclass", num_classes=num_classes, top_k=1).to(
+        "acc1": Accuracy("multiclass", num_classes=num_classes, top_k=1, ignore_index=0).to(
             device, non_blocking=True
         ),
-        "acc5": Accuracy("multiclass", num_classes=num_classes, top_k=5).to(
+        "acc5": Accuracy("multiclass", num_classes=num_classes, top_k=5, ignore_index=255).to(
             device, non_blocking=True
         ),
-        "loss": nn.functional.cross_entropy,
     }
     values = defaultdict(lambda: torch.zeros(1, device=device))
-    for im, la in tqdm(val_data, desc=f"Validating[{prefix}]", total=len(val_data)):
-        im, la = im.to(device, non_blocking=True), la.to(device, non_blocking=True)
-        for model_name, model in models.items():
-            out = model(im)
-            for metric_name, metric_fn in metrics.items():
-                values[f"{prefix}-{model_name}-val-{metric_name}"] += metric_fn(out, la)
 
-            # keeping track of cross entropy to donor models for sanity checking that the data is trending correctly
-            teacher_prob = torch.softmax(models["modelA"](im), dim=-1)
-            values[f"{prefix}-{model_name}-sanity-upstream_ce"] += nn.functional.cross_entropy(
-                out, teacher_prob
-            )
-            teacher_prob = torch.softmax(models["modelB"](im), dim=-1)
-            values[f"{prefix}-{model_name}-sanity-downstream_ce"] += nn.functional.cross_entropy(
-                out, teacher_prob
-            )
+    def voc_padding(padded_out, out):
+        VOC_CATS = [0, 5, 2, 16, 9, 44, 6, 3, 17, 62, 21, 67, 18, 19, 4, 1, 64, 20, 63, 7, 72]
+        for i in range(len(VOC_CATS)):
+            class_label = VOC_CATS[i]
+            class_prob = out[i]
+            #print(padded_out.shape, class_prob.shape, class_label)
+            padded_out[class_label, :, :] = class_prob
+        return padded_out
+
+    voc_padding_vec = torch.vmap(voc_padding, in_dims=0)
+    def order_output(out, donorB_ds_name):
+        if donorB_ds_name == "coco":
+            padded_out = torch.zeros((out.shape[0], num_classes, out.shape[-2], out.shape[-1])) - torch.inf
+            padded_out = voc_padding_vec(padded_out, out)
+            return padded_out
+        return out
+
+    donorA_ds_name, donorB_ds_name = ds_names
+    if donorA_ds_name != donorB_ds_name:
+        comparable_models = list(models.items())[1:]
+    else:
+        comparable_models = list(models.items())
+
+    with torch.no_grad():
+        for im, la in tqdm(val_data, desc=f"Validating[{prefix}]", total=len(val_data)):
+            im, la = im.to(device, non_blocking=True), la.to(device, non_blocking=True)
+            for model_name, model in comparable_models:
+                out = model(im)
+                out = order_output(out, donorB_ds_name).to(device)
+                #out = order_output(out, donorB_ds_name).argmax(dim=1).long().to(device)
+                
+
+                #print(f"{model_name}_validation-shapes", out.shape, la.shape)
+                for metric_name, metric_fn in metrics.items():
+                    values[f"{prefix}-{model_name}-val-{metric_name}"] += metric_fn(out, la)
+                values[f"{prefix}-{model_name}-val-loss"] += nn.functional.cross_entropy(out, la, ignore_index=255)
+
+                # keeping track of cross entropy to donor models for sanity checking that the data is trending correctly
+                '''teacher_prob = torch.softmax(models["modelA"](im), dim=-1)
+                values[f"{prefix}-{model_name}-sanity-upstream_ce"] += nn.functional.cross_entropy(
+                    out, teacher_prob
+                )'''
+                teacher_prob = torch.softmax(order_output(models["modelB"](im), donorB_ds_name), dim=-1).to(device)
+                values[f"{prefix}-{model_name}-sanity-downstream_ce"] += nn.functional.cross_entropy(
+                    out, teacher_prob
+                )
 
     # Average the validation metric values over the number of batches and log to mlflow
     values = {k: v.item() / len(val_data) for k, v in values.items()}
@@ -437,32 +483,41 @@ def run_analysis(
         "modelAxB": {k: _hash_tensor(v) for k, v in modelAxB.state_dict().items()},
     }
 
-    # Ensure all models are in eval mode and on device
-    modelA = donorA.model.eval().to(device)
-    modelB = donorB.model.eval().to(device)
-    modelAxB = modelAxB.eval().to(device)
 
     # Get dataloaders
     donorB.dataset.setup("fit")
     train_data = donorB.dataset.train_dataloader(
         batch_size=batch_size, num_workers=num_workers, drop_last=True
     )
+
+
     donorB.dataset.setup("val")
     val_data = donorB.dataset.val_dataloader(
-        batch_size=batch_size, num_workers=num_workers, drop_last=True
+        batch_size=int(batch_size / 4), num_workers=num_workers, drop_last=True
     )
+
+    
+
+    # Ensure all models are in eval mode and on device
+    modelA = donorA.model.to(device)
+    modelB = donorB.model.to(device)
+    modelAxB = modelAxB.to(device)
+
 
     # Phase zero: regression-based initialization
     if finetune_init in ["regression", "regression+stitch"]:
         run_regression_init(
             modelAxB, embedding_getter_A, embedding_getter_B, train_data, init_batches, device
         )
-        del embedding_getter_A, embedding_getter_B
+
+
+    del embedding_getter_A, embedding_getter_B
 
     snapshot_and_test(
         model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
+        (donorA.dataset_name, donorB.dataset_name),
         "regression",
         donorB.dataset.num_classes,
         device,
@@ -476,23 +531,25 @@ def run_analysis(
     modelB.eval()
     modelAxB.stitching_layer.train()
 
-    training_helper(
-        modelAxB=modelAxB,
-        modelA=modelA,
-        modelB=modelB,
-        train_data=train_data,
-        val_data=val_data,
-        frozen_modules=[modelA, modelB],
-        parameters=modelAxB.stitching_layer.parameters(),
-        logging_prefix="stitching",
-        config=stitching_config,
-        device=device,
-    )
+    if finetune_init in ["random+stitch", "regression+stitch"]:
+        training_helper(
+            modelAxB=modelAxB,
+            modelA=modelA,
+            modelB=modelB,
+            train_data=train_data,
+            val_data=val_data,
+            frozen_modules=[modelA, modelB],
+            parameters=modelAxB.stitching_layer.parameters(),
+            logging_prefix="stitching",
+            config=stitching_config,
+            device=device,
+        )
 
     snapshot_and_test(
         model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
+        [donorB.dataset_name],
         "stitching",
         donorB.dataset.num_classes,
         device,
@@ -530,6 +587,7 @@ def run_analysis(
         model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
+        [donorB.dataset_name],
         "finetuning",
         donorB.dataset.num_classes,
         device,
@@ -550,9 +608,12 @@ def run_regression_init(
             break
 
         im = im.to(device, non_blocking=True)
+        a_out = embedding_getter_A(im)
+        b_out =  embedding_getter_B(im)
+        
         modelAxB.stitching_layer.init_by_regression(
-            embedding_getter_A(im),
-            embedding_getter_B(im),
+            a_out,
+            b_out,
             batched=True,
             final_batch=i == init_batches - 1,
         )
@@ -605,9 +666,11 @@ if __name__ == "__main__":
     experiment_name = args.pop("mlflow_experiment")
     if not mlflow.get_experiment_by_name(experiment_name):
         mlflow.create_experiment(
-            experiment_name, artifact_location=f"/projects/learnable-stitching/{experiment_name}/"
+            experiment_name, artifact_location=f"/projects/learnable-stitching/{experiment_name}"
         )
     mlflow.set_experiment(experiment_name)
+
+    print(experiment_name)
 
     index = RunIndex.from_experiment(args, experiment_names=[experiment_name])
     if args in index:
@@ -638,5 +701,5 @@ if __name__ == "__main__":
     )
 
     # set up mlflow to record the run, log parameter experiments, and start the process to generate data for learnable stitching experiment
-    with logged_run(args, index):
+    with logged_run(args, index, run_name=run_name):
         run_analysis(**parser.instantiate(args).as_dict())
