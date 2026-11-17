@@ -2,6 +2,7 @@
 import time
 from csv import DictWriter
 from functools import partial
+import os
 
 import matplotlib.pyplot as plt
 import mlflow
@@ -14,12 +15,20 @@ from scipy.stats import norm
 
 from analysis.utils import pivot_heatmap, layer_idx, get_metric_history
 
-mlflow.set_tracking_uri("sqlite:////data/projects/learnable-stitching/mlflow.db")
+from dotenv import load_dotenv, find_dotenv
+
+load_dotenv(find_dotenv()) 
+
+user = os.getenv("MLFLOW_SQL_USERNAME")
+password = os.getenv("MLFLOW_SQL_PASSWORD")
+db_name = os.getenv("MLFLOW_SQL_DATABASE")
+
+mlflow.set_tracking_uri(f"mysql+pymysql://{user}:{password}@localhost:3306/{db_name}")
 mlflow.set_experiment("learnable-stitching-v0.5")
 client = mlflow.MlflowClient()
 
 params = {
-    "target_type": "TargetType.TASK",
+    'finetune_config.target_type' : 'TASK'
 }
 
 tstart = time.time()
@@ -28,8 +37,13 @@ df = search_runs_by_params(
 )
 print("Finished search in ", time.time() - tstart)
 
-df = df[df["params.stitch_init"].isna()]
 
+#print(df.columns)
+
+df = df[df['params.finetune_init'].notna()]
+
+#print(df.columns)
+print(df.shape)
 # %%
 
 all_params = [c for c in df.columns if c.startswith("params.")]
@@ -37,14 +51,14 @@ all_metrics = [c for c in df.columns if c.startswith("metrics.")]
 
 
 def shortname(row, ab):
-    model = row[f"params.donor{ab}_model"]
-    layer = row[f"params.donor{ab}_layer"]
+    model = row[f'params.donor{ab}.model'] #params.donorA.model
+    layer = row[f'params.donor{ab}.layer'] #params.donorB.layer
     return model[0] + model[-2:] + f"_{layer_idx(layer):02d}"
 
 
 def shortname_marked(row, ab, mark):
-    model = row[f"params.donor{ab}_model"] + mark
-    layer = row[f"params.donor{ab}_layer"]
+    model = row[f"params.donor{ab}.model"] + mark
+    layer = row[f"params.donor{ab}.layer"]
     return model[0] + model[-2:] + f"_{layer_idx(layer):02d}"
 
 
@@ -57,21 +71,21 @@ if (set(df["upstream"]) - set(df["downstream"])) or (set(df["downstream"]) - set
     print("Warning: some missing runs; upstream and downstream sets differ")
 
 
-groups = df.groupby(["params.donorA_model", "params.donorB_model"])
+groups = df.groupby(["params.donorA.model", "params.donorB.model"])
 
 # Check for any duplicates or missing combinations of layers x models
 dup = False
 for models, group in groups:
-    layersA = group["params.donorA_layer"].unique()
-    layersB = group["params.donorB_layer"].unique()
+    layersA = group["params.donorA.layer"].unique()
+    layersB = group["params.donorB.layer"].unique()
     expected_combinations = set((a, b) for a in layersA for b in layersB)
     actual_combinations = set(
-        (row["params.donorA_layer"], row["params.donorB_layer"]) for _, row in group.iterrows()
+        (row["params.donorA.layer"], row["params.donorB.layer"]) for _, row in group.iterrows()
     )
     missing_combinations = expected_combinations - actual_combinations
     if missing_combinations:
         print(f"Missing combinations for models {models}: {missing_combinations}")
-    duplicates = group.duplicated(subset=["params.donorA_layer", "params.donorB_layer"], keep=False)
+    duplicates = group.duplicated(subset=["params.donorA.layer", "params.donorB.layer"], keep=False)
     if duplicates.any():
         print(f"Duplicate entries found for models {models}:")
         print(*[name[7:] for name in all_params], sep="\t")
@@ -80,9 +94,9 @@ for models, group in groups:
             for other_idx, other_row in group[duplicates].iterrows():
                 if idx == other_idx:
                     continue
-                if (row["params.donorA_layer"], row["params.donorB_layer"]) == (
-                    other_row["params.donorA_layer"],
-                    other_row["params.donorB_layer"],
+                if (row["params.donorA.layer"], row["params.donorB.layer"]) == (
+                    other_row["params.donorA.layer"],
+                    other_row["params.donorB.layer"],
                 ):
                     print("=>", *other_row[all_params], sep="\t")
         dup = True
@@ -113,7 +127,7 @@ plt.show()
 plt.figure(figsize=(10, 15))
 pivot_heatmap(
     df,
-    metric="metrics.downstream-modelAxB-val-loss",
+    metric="metrics.finetuning-modelAxB-val-loss",
     row_col="upstream",
     col_col="downstream",
     vmin=0,
@@ -131,7 +145,7 @@ plt.show()
 
 for (modelA, modelB), group in groups:
     fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-    group["params.donorA_layer"] = group["params.donorA_layer"].map(lambda a: "up-" + a)
+    group["params.donorA.layer"] = group["params.donorA.layer"].map(lambda a: "up-" + a)
 
     cell_width = 0.1
     cell_height = 0.1
@@ -140,8 +154,8 @@ for (modelA, modelB), group in groups:
     pivot_heatmap(
         group,
         metric="metrics.stitching-modelAxB-val-loss",
-        row_col="params.donorA_layer",
-        col_col="params.donorB_layer",
+        row_col="params.donorA.layer",
+        col_col="params.donorB.layer",
         vmin=0,
         vmax=10,
         ax=ax[0],
@@ -175,9 +189,9 @@ for (modelA, modelB), group in groups:
 
     pivot_heatmap(
         group,
-        metric="metrics.downstream-modelAxB-val-loss",
-        row_col="params.donorA_layer",
-        col_col="params.donorB_layer",
+        metric="metrics.finetuning-modelAxB-val-loss",
+        row_col="params.donorA.layer",
+        col_col="params.donorB.layer",
         vmin=0,
         vmax=10,
         ax=ax[1],
@@ -326,7 +340,7 @@ def plot_loss_sequence(
     )
     hist_finetune = get_metric_history(
         run_id,
-        "downstream-modelAxB-train-loss",
+        "finetuning-modelAxB-train-loss",
         mlflow_client=client,
         bin_steps=bin_steps,
     )
@@ -456,7 +470,7 @@ sns.scatterplot(
     df, x="metrics.stitching-modelAxB-val-loss", y="metrics.stitching-posthoc-val-loss-mean"
 )
 sns.scatterplot(
-    df, x="metrics.downstream-modelAxB-val-loss", y="metrics.downstream-posthoc-val-loss-mean"
+    df, x="metrics.finetuning-modelAxB-val-loss", y="metrics.finetuning-posthoc-val-loss-mean"
 )
 plt.axis("equal")
 plt.grid(True)
@@ -468,7 +482,7 @@ sns.scatterplot(
     df, x="metrics.stitching-modelAxB-val-acc1", y="metrics.stitching-posthoc-val-acc-mean"
 )
 sns.scatterplot(
-    df, x="metrics.downstream-modelAxB-val-acc1", y="metrics.downstream-posthoc-val-acc-mean"
+    df, x="metrics.finetuning-modelAxB-val-acc1", y="metrics.finetuning-posthoc-val-acc-mean"
 )
 plt.axis("equal")
 plt.grid(True)
@@ -488,13 +502,13 @@ def a_bigger_than_b_test(mean_a, mcse_a, mean_b, mcse_b):
 
 
 LOSS_AFTER_STITCHING = "metrics.stitching-modelAxB-val-loss"
-LOSS_AFTER_FINETUNING = "metrics.downstream-modelAxB-val-loss"
+LOSS_AFTER_FINETUNING = "metrics.finetuning-modelAxB-val-loss"
 ACC_AFTER_STITCHING = "metrics.stitching-modelAxB-val-acc1"
-ACC_AFTER_FINETUNING = "metrics.downstream-modelAxB-val-acc1"
+ACC_AFTER_FINETUNING = "metrics.finetuning-modelAxB-val-acc1"
 LOSS_AFTER_STITCHING_MCSE = "metrics.stitching-posthoc-val-loss-mcse"
-LOSS_AFTER_FINETUNING_MCSE = "metrics.downstream-posthoc-val-loss-mcse"
+LOSS_AFTER_FINETUNING_MCSE = "metrics.finetuning-posthoc-val-loss-mcse"
 ACC_AFTER_STITCHING_MCSE = "metrics.stitching-posthoc-val-acc-mcse"
-ACC_AFTER_FINETUNING_MCSE = "metrics.downstream-posthoc-val-acc-mcse"
+ACC_AFTER_FINETUNING_MCSE = "metrics.finetuning-posthoc-val-acc-mcse"
 
 perf_mean_var = pd.read_csv("analysis/mv.csv")
 mv_stitch = perf_mean_var[perf_mean_var["phase"] == "stitching"].set_index("run_id")

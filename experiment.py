@@ -207,7 +207,7 @@ def snapshot_and_test(hashes, models, val_data, ds_names, prefix, num_classes, d
 
     # the metrics listed are measured on the validation set of the data
     metrics = {
-        "acc1": Accuracy("multiclass", num_classes=num_classes, top_k=1, ignore_index=0).to(
+        "acc1": Accuracy("multiclass", num_classes=num_classes, top_k=1, ignore_index=255).to(
             device, non_blocking=True
         ),
         "acc5": Accuracy("multiclass", num_classes=num_classes, top_k=5, ignore_index=255).to(
