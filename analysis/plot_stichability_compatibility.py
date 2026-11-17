@@ -425,7 +425,7 @@ def plot_loss_sequence(
             color=color,
             ecolor=color,
             capsize=3,
-            label=(label.split(" ")[-1] + " fine-tuning validation mean"),
+            label=(label.split(" ")[-1] + "fine-tuning validation mean"),
         )
 
 
