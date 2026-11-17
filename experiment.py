@@ -158,6 +158,12 @@ def loss_metrics_helper(
         outAxB: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Helper function to compute loss and metrics for the given target type."""
+        # imagenet and coco have classes in different dimensions
+    '''if donorB_ds_name == "coco": TODO: refactor this to change accuracy dimension based off dataset
+        dim = 1
+    else:
+        dim = -1'''
+
     if outAxB is None:
         outAxB = modelAxB(im)
     task_acc = (torch.argmax(outAxB, dim=1) == la).float().mean()
@@ -210,6 +216,11 @@ def snapshot_and_test(hashes, models, val_data, ds_names, prefix, num_classes, d
     }
     values = defaultdict(lambda: torch.zeros(1, device=device))
 
+
+
+    # We are using networks pretrained on VOC COCO which is a subset of coco for 21 categories
+    # However, we do no have VOC COCO, we have COCO, so to calculate accuracy correctly we have 
+    # pad the model output with all of the missing classes to ensure the multi-accuracy does not have an index error
     def voc_padding(padded_out, out):
         VOC_CATS = [0, 5, 2, 16, 9, 44, 6, 3, 17, 62, 21, 67, 18, 19, 4, 1, 64, 20, 63, 7, 72]
         for i in range(len(VOC_CATS)):
@@ -233,28 +244,35 @@ def snapshot_and_test(hashes, models, val_data, ds_names, prefix, num_classes, d
     else:
         comparable_models = list(models.items())
 
+        # imagenet and coco have classes in different dimensions
+    if donorB_ds_name == "coco":
+        dim = 1
+    else:
+        dim = -1
+
     with torch.no_grad():
         for im, la in tqdm(val_data, desc=f"Validating[{prefix}]", total=len(val_data)):
             im, la = im.to(device, non_blocking=True), la.to(device, non_blocking=True)
             for model_name, model in comparable_models:
                 out = model(im)
-                out = order_output(out, donorB_ds_name).to(device)
+                ord_out = order_output(out, donorB_ds_name).to(device)
                 #out = order_output(out, donorB_ds_name).argmax(dim=1).long().to(device)
                 
 
-                #print(f"{model_name}_validation-shapes", out.shape, la.shape)
+                #print(f"{model_name}_validation-shapes", ord_out.shape, out.shape, la.shape)
                 for metric_name, metric_fn in metrics.items():
-                    values[f"{prefix}-{model_name}-val-{metric_name}"] += metric_fn(out, la)
-                values[f"{prefix}-{model_name}-val-loss"] += nn.functional.cross_entropy(out, la, ignore_index=255)
+                    values[f"{prefix}-{model_name}-val-{metric_name}"] += metric_fn(ord_out, la)
+                values[f"{prefix}-{model_name}-val-loss"] += nn.functional.cross_entropy(out.to(device), la, ignore_index=255).to(device)
 
                 # keeping track of cross entropy to donor models for sanity checking that the data is trending correctly
                 '''teacher_prob = torch.softmax(models["modelA"](im), dim=-1)
                 values[f"{prefix}-{model_name}-sanity-upstream_ce"] += nn.functional.cross_entropy(
                     out, teacher_prob
                 )'''
-                teacher_prob = torch.softmax(order_output(models["modelB"](im), donorB_ds_name), dim=-1).to(device)
+                teacher_prob = torch.softmax(order_output(models["modelB"](im), donorB_ds_name), dim=dim).to(device)
+                out_prob = torch.softmax(ord_out, dim=dim).to(device)
                 values[f"{prefix}-{model_name}-sanity-downstream_ce"] += nn.functional.cross_entropy(
-                    out, teacher_prob
+                    out_prob, teacher_prob
                 )
 
     # Average the validation metric values over the number of batches and log to mlflow
@@ -272,7 +290,7 @@ class TrainingConfig:
     quick_val_batches: int = 10
     max_steps: int = 10000
     use_best_val: bool = True
-    smallest_reasonable_lr: float = 1e-8
+    smallest_reasonable_lr: float = 1e-10
     largest_reasonable_lr: float = 0.1
 
 
@@ -325,10 +343,12 @@ def training_helper(
             ),
         )
         try:
+            lr_suggestion, repick_flag = lr_finder.suggestion()
             init_lr = min(
                 config.largest_reasonable_lr,
-                max(config.smallest_reasonable_lr, lr_finder.suggestion()),
+                max(config.smallest_reasonable_lr, lr_suggestion),
             )
+            mlflow.log_metric(logging_prefix + "-init-range-too-small", repick_flag)
         except UnstableLREstimate:
             init_lr = config.smallest_reasonable_lr
     else:
@@ -549,7 +569,7 @@ def run_analysis(
         model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
-        [donorB.dataset_name],
+        (donorA.dataset_name, donorB.dataset_name),
         "stitching",
         donorB.dataset.num_classes,
         device,
@@ -587,7 +607,7 @@ def run_analysis(
         model_hashes,
         {"modelA": modelA, "modelB": modelB, "modelAxB": modelAxB},
         val_data,
-        [donorB.dataset_name],
+        (donorA.dataset_name, donorB.dataset_name),
         "finetuning",
         donorB.dataset.num_classes,
         device,

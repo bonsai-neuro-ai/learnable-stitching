@@ -16,15 +16,4 @@ if __name__ == "__main__":
     node_list = []
     for node in module_graph.graph.nodes:
         node_list.append(node)
-
-    if args.layers == "even":
-        for node in node_list[::2]:
-            print(node.name)
-    elif args.layers == "odd":
-        for node in node_list[1::2]:
-            print(node.name)
-    elif args.layers == "all":
-        for node in node_list:
-            print(node.name)
-    else:
-        print("layer option has not been choosen")
+        print(node.name)

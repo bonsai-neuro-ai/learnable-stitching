@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-MODELSA=(
+MODELSB=(
   "fcn_resnet50"
 )
 
-MODELSB=(
+MODELSA=(
   "resnet18"
   "resnet34"
   "resnet50"
@@ -33,24 +33,24 @@ while getopts "c:t:s:" opt; do
 done
 
 for MODELA in "${MODELSA[@]}"; do
-  LAYERSA=($(python3 -m model_info $MODELA --layers "odd" | grep "add"))
+  LAYERSA=($(python3 -m model_info $MODELA | grep "add" | awk 'NR % 2 == 0'))
   for MODELB in "${MODELSB[@]}"; do
     if [ "$MODELA" = "$MODELB" ]; then continue; fi
-    LAYERSB=($(python3 -m model_info $MODELB --layers "odd" | grep "add"))
+    LAYERSB=($(python3 -m model_info $MODELB | grep "add" | awk 'NR % 2 == 0'))
     for LAYERA in "${LAYERSA[@]}"; do
       for LAYERB in "${LAYERSB[@]}"; do
           CUDA_VISIBLE_DEVICES="$device" python3 experiment.py \
             --donorA.model="$MODELA" \
             --donorA.layer="$LAYERA" \
-            --donorA.dataset="coco" \
+            --donorA.dataset="imagenet" \
             --donorB.model="$MODELB" \
             --donorB.layer="$LAYERB" \
-            --donorB.dataset="imagenet" \
+            --donorB.dataset="coco" \
             --stitch_family="1x1Conv" \
             --finetune_init="$stitch_init" \
-            --batch_size=200 \
+            --batch_size=75 \
             --num_workers=4 \
-            --mlflow_experiment="learnable-stitching-v0.5" || exit 1
+            --mlflow_experiment="learnable-stitching-v0.5"
         done
       done
   done
