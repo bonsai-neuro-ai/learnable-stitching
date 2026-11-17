@@ -15,7 +15,7 @@ from scipy.stats import norm
 from analysis.utils import pivot_heatmap, layer_idx, get_metric_history
 
 mlflow.set_tracking_uri("sqlite:////data/projects/learnable-stitching/mlflow.db")
-mlflow.set_experiment("learnable-stitching-v0.4")
+mlflow.set_experiment("learnable-stitching-v0.5")
 client = mlflow.MlflowClient()
 
 params = {
@@ -24,7 +24,7 @@ params = {
 
 tstart = time.time()
 df = search_runs_by_params(
-    experiment_name="learnable-stitching-v0.4", params=params, finished_only=True
+    experiment_name="learnable-stitching-v0.5", params=params, finished_only=True
 )
 print("Finished search in ", time.time() - tstart)
 
